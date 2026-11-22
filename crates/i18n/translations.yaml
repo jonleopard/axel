@@ -1684,3 +1684,7 @@
   zh-Hans: "此话题上没有智能体在工作"
 "no agent on this thread has a pane":
   zh-Hans: "此话题上没有智能体拥有面板"
+"could not read the standing skills: {error}":
+  zh-Hans: "无法读取常驻技能：{error}"
+"standing skill {name} left out: the standing rules pass {max} bytes":
+  zh-Hans: "常驻技能 {name} 未加入：常驻规则超过 {max} 字节"

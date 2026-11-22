@@ -89,7 +89,8 @@ impl WorkspaceConfig {
     pub fn parse(text: &str) -> Result<WorkspaceConfig, Error>;
     pub fn template(workspace_name: &str) -> String;
 }
-pub struct Skill { pub name: String, pub path: PathBuf, pub description: Option<String> }
+pub struct Skill { pub name: String, pub path: PathBuf, pub description: Option<String>, pub always: bool /* frontmatter `always: true` */ }
+pub fn standing_skills(global: Option<&Path>) -> Result<Vec<Skill>, Error>;  // global skills with always: true, inlined in every session's system prompt
 pub fn find_all_skills(sources: &[SkillSource], global: Option<&Path>) -> Result<indexmap::IndexMap<String, Skill>, Error>;  // directories only
 pub fn find_skills(roots: &[remote::SkillRoot], global: Option<&Path>) -> Result<indexmap::IndexMap<String, Skill>, Error>;  // dirs, then remote, then global
 pub mod remote {   // AXEL.lock pins each remote source to a commit; cache <cache>/github/<owner>/<repo>/<commit>/

@@ -796,12 +796,46 @@ fn unlinked_context(harness: &axel_store::Harness, dir: &Path) -> Option<String>
     Some(config.body)
 }
 
-/// [`identity_prompt`], plus `AXEL.md` when the harness wouldn't otherwise see it.
+/// [`identity_prompt`], then the owner's standing rules, then `AXEL.md` when
+/// the harness wouldn't otherwise see it.
 pub fn system_prompt(agent: &axel_store::Agent, dir: &Path) -> String {
     let mut s = identity_prompt(agent);
+    let global = axel_config::default_global_skills_dir();
+    match axel_config::standing_skills(global.as_deref()) {
+        Ok(skills) => s.push_str(&standing_rules(&skills)),
+        // A session still starts; it just lacks the rules it should have had.
+        Err(e) => eprintln!("axel: {}", t!("could not read the standing skills: {error}", error = e)),
+    }
     if let Some(body) = unlinked_context(&agent.harness, dir) {
         s.push_str("\n\n# This project's AXEL.md\n\n");
         s.push_str(&body);
+    }
+    s
+}
+
+/// The most standing-rule text one system prompt carries. The owner's four
+/// skills are 17 KB; 64 KiB leaves room to grow and still caps a runaway file.
+const STANDING_BYTES_MAX: usize = 64 * 1024;
+
+/// The global skills marked `always: true`, in full, as a system-prompt
+/// section: every session follows them without having to invoke them.
+fn standing_rules(skills: &[axel_config::Skill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n\n# The owner's standing rules\n\nThe owner requires these in every session, for every task: \
+         follow them without being asked, and let them win over any default of yours that disagrees \
+         (such as adding an AI co-author line to a commit). Each is also a skill of the same name.",
+    );
+    for skill in skills {
+        assert!(skill.always, "only skills marked always are standing rules");
+        let Ok(body) = skill.body() else { continue };
+        if s.len() + body.len() > STANDING_BYTES_MAX {
+            eprintln!("axel: {}", t!("standing skill {name} left out: the standing rules pass {max} bytes", name = skill.name, max = STANDING_BYTES_MAX));
+            continue;
+        }
+        s.push_str(&format!("\n\n## Standing rule: {}\n\n{}", skill.name, body));
     }
     s
 }
@@ -980,7 +1014,20 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkspaceConfig, drivers, install_skills, normalize_repo_url};
+    use super::{WorkspaceConfig, drivers, install_skills, normalize_repo_url, standing_rules};
+
+    #[test]
+    fn standing_skills_are_written_in_full_after_a_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("style.md");
+        std::fs::write(&path, "---\nname: style\nalways: true\n---\n# Style\n\nAssert every invariant.\n").unwrap();
+        let skill = axel_config::Skill::from_file(&path).unwrap();
+        let rules = standing_rules(std::slice::from_ref(&skill));
+        assert!(rules.contains("# The owner's standing rules"), "{rules}");
+        assert!(rules.contains("## Standing rule: style\n\n# Style\n\nAssert every invariant."), "{rules}");
+        assert!(!rules.contains("always: true"), "frontmatter stays out");
+        assert_eq!(standing_rules(&[]), "", "no standing skill, no section");
+    }
 
     #[test]
     fn the_session_tool_server_gets_identity_but_not_the_prompt() {

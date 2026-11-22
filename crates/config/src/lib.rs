@@ -30,4 +30,5 @@ pub use error::Error;
 pub use indexmap::IndexMap;
 pub use skills::{
     SKILL_FILE, Skill, default_global_skills_dir, find_all_skills, find_skills, missing_skills, resolve_skills,
+    standing_skills,
 };

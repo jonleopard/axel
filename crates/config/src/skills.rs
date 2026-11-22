@@ -24,6 +24,9 @@ pub struct Skill {
     pub path: PathBuf,
     /// Frontmatter `description`, or the first non-heading line of the body.
     pub description: Option<String>,
+    /// Frontmatter `always: true`: a standing rule, written into every
+    /// session's system prompt instead of waiting to be invoked.
+    pub always: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -32,6 +35,8 @@ struct SkillFrontmatter {
     name: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    always: bool,
 }
 
 impl Skill {
@@ -75,6 +80,7 @@ impl Skill {
             name,
             path: path.to_path_buf(),
             description,
+            always: frontmatter.always,
         })
     }
 
@@ -105,6 +111,13 @@ fn summary_line(body: &str) -> Option<String> {
 /// `~/.config/axel/skills`, the conventional machine-wide skill directory.
 pub fn default_global_skills_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".config").join("axel").join("skills"))
+}
+
+/// The global skills marked `always: true`, by name. Only the machine-wide
+/// directory may hold standing rules: they are the owner's, not a project's.
+pub fn standing_skills(global: Option<&Path>) -> Result<Vec<Skill>, Error> {
+    let all = find_skills(&[], global)?;
+    Ok(all.into_values().filter(|s| s.always).collect())
 }
 
 /// Discover every skill in the directory sources (in order), then `global`. Remote
@@ -213,6 +226,19 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn only_global_skills_marked_always_are_standing() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global");
+        write(&global.join("style/SKILL.md"), "---\nname: style\nalways: true\n---\n# Style\nAssert.\n");
+        write(&global.join("docs/SKILL.md"), "---\nname: docs\n---\n# Docs\n");
+        write(&global.join("loose.md"), "---\nalways: yes please\n---\nnot a boolean\n");
+        let standing = standing_skills(Some(&global)).unwrap();
+        let names: Vec<_> = standing.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["style"]);
+        assert!(standing_skills(Some(&root.path().join("missing"))).unwrap().is_empty());
     }
 
     #[test]

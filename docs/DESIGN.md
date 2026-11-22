@@ -195,6 +195,12 @@ $ axel                               # in any Rex terminal
      `AXEL.lock`; a directory skill is linked whole, scripts and all), and links
      `AXEL.md` as `CLAUDE.md` / `AGENTS.md` (relative; when the project has its own,
      `AXEL.md` goes into the appended system prompt instead),
+   - writes the owner's **standing rules** into that appended system prompt, in full:
+     every global skill (`~/.config/axel/skills`) whose frontmatter says `always: true`,
+     such as the coding style and the commit convention. Skills are otherwise loaded
+     only when an agent invokes them; standing rules hold in every session and every
+     harness (Claude in a pane or managed, Codex), whatever the agent's skill list.
+     Only the global directory can hold them: they are the owner's, not a project's,
    - writes harness hook config so events flow back (see *Signals*),
    - starts the session: a managed one is hosted by `axel session host`; a pane one
      runs the harness with `AXEL_THREAD`, `AXEL_SESSION`, `AXEL_AGENT`, `AXEL_DB` in
