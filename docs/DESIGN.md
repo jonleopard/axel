@@ -604,9 +604,19 @@ thread view (TUI, any pane) ──unix socket──▶ axel session host <id> �
 - **Questions**: Claude's `AskUserQuestion` is on. The Claude adapter asks each question
   as a `session/request_permission` whose options are the choices (ids `answer:<n>`, plus
   `answer:none` for "none of these"); the host never lets policy answer those, records a
-  `Question` item, and reports `blocked` + `kind=question`. The composer opens each new
-  question in a floating, centered pane (`axel thread answer THREAD ITEM`): ↑↓ and Enter,
-  or a digit, answers it; Esc leaves it to the composer. The labels picked go back to
+  `Question` item, and reports `blocked` + `kind=question`. The composer puts each new
+  question to you through Rex (`axel thread ask THREAD ITEM`, its own process): every
+  connected Rex app, Mac and iPhone, shows it in the command palette and the first answer
+  wins. A single-choice question also takes typed text, which declines it and redirects
+  the agent as the composer's Enter does. A multi-select answer outside its bounds is
+  asked again with the bounds in the title. When the question is answered elsewhere, Axel
+  stops waiting and Rex closes the prompt everywhere. Rex asks only from a configuration
+  file action, so Axel keeps `axel.lua` in Rex's config directory, required from a fenced
+  block in `init.lua` (`axel rex setup [--remove]`; installed on first use and by `axel
+  setup`). When Rex can't reach anyone (no app, module refused) the question opens in a
+  floating, centered pane instead (`axel thread answer THREAD ITEM`), as it always does
+  with `AXEL_QUESTIONS=pane`: ↑↓ and Enter, or a digit, answers it; Esc leaves it to the
+  composer. The labels picked go back to
   Claude as the tool's `answers`. Multi-select questions show checkboxes: Space or
   digits toggle, Enter confirms the selected set. Decline clears other checks;
   single-choice questions retain immediate Enter/digit answers. MCP array enum

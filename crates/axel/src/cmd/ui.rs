@@ -879,6 +879,8 @@ pub(crate) fn label_renames_thread(label: &str, window_id: &str, title: &str) ->
 /// the stream above goes with it.
 pub fn run_compose(thread_id: &str) -> Result<()> {
     let ctx = Ctx::open()?;
+    // Rex's palette reaches this thread through the composer's own connection.
+    super::rex_link::spawn(thread_id.to_string());
     let cwd = std::env::current_dir().context(t!("reading the current directory"))?;
     let send = |session_id: &str, cmd: SendCommand| -> Result<SendReply> { send_to_session(&ctx, session_id, cmd) };
     let summon = |thread_id: &str, agent: &str, text: &str, files: &[std::path::PathBuf]| -> Result<String> { summon(&ctx, thread_id, agent, text, files) };
@@ -1015,7 +1017,7 @@ fn block_beside(view: &serde_json::Value, block: &str, label: &str) -> Option<St
 
 /// Show an agent's session pane right of `beside` when it's minimized
 /// (detached), or minimize it again when it's showing.
-fn toggle_agent_pane(rex: &axel_rex::Rex, block: &str, beside: &str) {
+pub(super) fn toggle_agent_pane(rex: &axel_rex::Rex, block: &str, beside: &str) {
     let placed = rex
         .api_call("session.describe_block", serde_json::json!({ "block_id": block }))
         .ok()
@@ -1036,9 +1038,126 @@ const QUESTION_BOUNDS: [f64; 4] = [0.2, 0.3, 0.6, 0.36];
 /// The floating question pane's label.
 const QUESTION_LABEL: &str = "question";
 
+/// Where an agent's question reaches you. `AXEL_QUESTIONS=pane` keeps the
+/// floating pane; anything else asks through Rex, in every connected app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuestionSurface {
+    Rex,
+    Pane,
+}
+
+fn question_surface() -> QuestionSurface {
+    match std::env::var("AXEL_QUESTIONS").as_deref() {
+        Ok("pane") => QuestionSurface::Pane,
+        _ => QuestionSurface::Rex,
+    }
+}
+
+/// Put a question an agent asked in front of you: through Rex, on every
+/// device, or in a floating pane over this window.
+fn open_question(rex: &axel_rex::Rex, thread_id: &str, item_id: &str) {
+    if question_surface() == QuestionSurface::Pane {
+        return open_question_pane(rex, thread_id, item_id);
+    }
+    // A process of its own: the question stays open on your devices after
+    // this composer closes, and waiting never holds the composer up.
+    let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "axel".into());
+    let spawned = std::process::Command::new(exe)
+        .args(["thread", "ask", thread_id, item_id])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawned {
+        Ok(mut child) => {
+            // Reap it when it ends; it outlives us if the composer closes first.
+            std::thread::spawn(move || child.wait());
+        }
+        Err(_) => open_question_pane(rex, thread_id, item_id),
+    }
+}
+
+/// `axel thread ask`: put one question to you through Rex and send your
+/// answer to the agent; open the answer pane when Rex can't reach anyone.
+pub fn run_ask(thread_id: &str, item_id: &str) -> Result<()> {
+    let ctx = Ctx::open()?;
+    let rex = ctx.rex.as_ref().context(t!("questions through Rex need Rex"))?;
+    if let Err(error) = ensure_rex_module() {
+        eprintln!("axel: {error:#}");
+        open_question_pane(rex, thread_id, item_id);
+        return Ok(());
+    }
+    let cwd = std::env::current_dir().context(t!("reading the current directory"))?;
+    let send = |session_id: &str, cmd: SendCommand| -> Result<SendReply> { send_to_session(&ctx, session_id, cmd) };
+    let summon = |_: &str, _: &str, _: &str, _: &[std::path::PathBuf]| -> Result<String> { anyhow::bail!("not from here") };
+    let runtime_label = |h: &axel_store::Harness| launch::runtime_label(h);
+    let deps = Deps { store: &ctx.store, keystore: &ctx.keystore, cwd, harnesses: harnesses(), send: &send, summon: &summon, runtime_label: &runtime_label, open_thread: None, focus_peer: None, fit_prompt: None, manage_thread: None, open_controls: None, open_terminal: None };
+    let ask = |pick: &axel_rex::prompt::Pick, stop: &dyn Fn() -> bool| rex.ask(pick, stop).map_err(anyhow::Error::from);
+    match axel_tui::run_rex_question(&deps, thread_id, item_id, &ask)? {
+        axel_tui::RexQuestion::Answered | axel_tui::RexQuestion::Left => Ok(()),
+        axel_tui::RexQuestion::Unreachable(why) => {
+            eprintln!("axel: {}", t!("Rex couldn't ask ({why}); opening the answer pane", why = why));
+            open_question_pane(rex, thread_id, item_id);
+            Ok(())
+        }
+    }
+}
+
+/// Install or update `axel.lua` in Rex's configuration, reloading Rex when
+/// it changed. Cheap when it is current: two file reads.
+pub(super) fn ensure_rex_module() -> Result<()> {
+    let dir = axel_rex::prompt::config_dir().context(t!("no Rex configuration directory: HOME is not set"))?;
+    if axel_rex::prompt::is_current(&dir) {
+        return Ok(());
+    }
+    let installed = axel_rex::prompt::install(&dir, &rex_module_source())
+        .with_context(|| t!("installing axel.lua in {dir}", dir = dir.display()))?;
+    if installed.needs_reload() {
+        axel_rex::prompt::reload()?;
+    }
+    Ok(())
+}
+
+/// The module for this `axel`: by the name it has on PATH when that is this
+/// binary, so a reinstall that relinks it keeps working; else this binary.
+fn rex_module_source() -> String {
+    let exe = std::env::current_exe().ok();
+    let same = |p: &std::path::Path| exe.as_ref().is_some_and(|e| std::fs::canonicalize(p).ok() == std::fs::canonicalize(e).ok());
+    let program = launch::which("axel")
+        .filter(|p| same(p))
+        .or(exe)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "axel".into());
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into());
+    axel_rex::prompt::module_source(&program, &path)
+}
+
+/// `axel rex setup [--remove]`.
+pub fn rex_setup(remove: bool) -> Result<()> {
+    let dir = axel_rex::prompt::config_dir().context(t!("no Rex configuration directory: HOME is not set"))?;
+    let changed = if remove {
+        axel_rex::prompt::remove(&dir).with_context(|| t!("removing axel.lua from {dir}", dir = dir.display()))?
+    } else {
+        let installed = axel_rex::prompt::install(&dir, &rex_module_source())
+            .with_context(|| t!("installing axel.lua in {dir}", dir = dir.display()))?;
+        installed.needs_reload()
+    };
+    if changed {
+        axel_rex::prompt::reload()?;
+    }
+    let file = dir.join(axel_rex::prompt::MODULE_FILE);
+    match (remove, changed) {
+        (true, true) => println!("{}", t!("removed {file}; Rex reloaded its configuration", file = file.display())),
+        (true, false) => println!("{}", t!("nothing to remove in {dir}", dir = dir.display())),
+        (false, true) => println!("{}", t!("installed {file}; agents' questions now reach every Rex app", file = file.display())),
+        (false, false) => println!("{}", t!("{file} is up to date", file = file.display())),
+    }
+    Ok(())
+}
+
 /// Open `axel thread answer` for `item_id` in a floating pane over this
 /// window, focused, so you can answer it right away.
-fn open_question(rex: &axel_rex::Rex, thread_id: &str, item_id: &str) {
+fn open_question_pane(rex: &axel_rex::Rex, thread_id: &str, item_id: &str) {
     let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "axel".into());
     let cmd = vec![exe, "thread".into(), "answer".into(), thread_id.to_string(), item_id.to_string()];
     if let Err(e) = rex.new_floating_terminal_with_focus(QUESTION_LABEL, QUESTION_BOUNDS, &cmd, None, &passthrough_env(), true) {
@@ -1050,7 +1169,7 @@ fn open_question(rex: &axel_rex::Rex, thread_id: &str, item_id: &str) {
 const CONTROLS_BOUNDS: [f64; 4] = [0.22, 0.14, 0.56, 0.52];
 const CONTROLS_LABEL: &str = "thread";
 
-fn open_controls(rex: &axel_rex::Rex, thread_id: &str) {
+pub(super) fn open_controls(rex: &axel_rex::Rex, thread_id: &str) {
     let exe = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "axel".into());
     let cmd = vec![exe, "thread".into(), "manage".into(), thread_id.to_string()];
     if let Err(e) = rex.new_floating_terminal_with_focus(CONTROLS_LABEL, CONTROLS_BOUNDS, &cmd, None, &passthrough_env(), true) {

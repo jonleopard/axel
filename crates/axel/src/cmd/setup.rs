@@ -186,6 +186,13 @@ fn check_machine() -> bool {
             dim(t!("not here: Axel runs inline (superlogical.com/rex)"))
         },
     );
+    if rex {
+        // Agents' questions reach every Rex app through a module in Rex's config.
+        match super::ui::ensure_rex_module() {
+            Ok(()) => check(true, t!("Rex questions"), t!("on every Rex app, Mac and iPhone").into()),
+            Err(e) => check(false, t!("Rex questions"), dim(&t!("in a pane: {error}", error = format!("{e:#}")))),
+        }
+    }
     check(
         which("git").is_some(),
         "git",

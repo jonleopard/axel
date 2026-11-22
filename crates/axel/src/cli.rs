@@ -120,6 +120,12 @@ pub enum Command {
     /// Prune old turn checkpoints (archived threads after a week; a month for
     /// live ones, keeping each session's latest turns).
     Gc,
+    /// Axel's part of Rex: the `axel.lua` module that lets agents' questions
+    /// reach you in every Rex app, Mac and iPhone.
+    Rex {
+        #[command(subcommand)]
+        command: RexCommand,
+    },
     /// `axel-links://` links (a click on a run of tool calls opens its details).
     Links {
         #[command(subcommand)]
@@ -349,6 +355,10 @@ pub enum ThreadCommand {
     /// One question an agent asked, to answer (the floating pane the composer opens).
     #[command(hide = true)]
     Answer { thread: String, item: String },
+    /// One question an agent asked, put to you by every connected Rex app;
+    /// the answer pane opens instead when Rex can't reach anyone.
+    #[command(hide = true)]
+    Ask { thread: String, item: String },
     /// A run of tool calls in full (the floating pane a click on one opens).
     #[command(hide = true)]
     Tools { thread: String, fold: String },
@@ -405,6 +415,11 @@ pub enum ThreadCommand {
         project: std::path::PathBuf,
         #[arg(long, value_name = "BRANCH", num_args = 0..=1, default_missing_value = "")]
         worktree: Option<String>,
+    },
+    /// Questions agents are waiting for you to answer, oldest first.
+    Questions {
+        #[arg(long)]
+        json: bool,
     },
     /// List threads.
     #[command(alias = "list")]
@@ -547,6 +562,16 @@ impl From<AgentColorArg> for AgentColor {
             AgentColorArg::Orange => AgentColor::Orange,
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RexCommand {
+    /// Install or update `axel.lua` in Rex's configuration and reload it.
+    Setup {
+        /// Take it out again, with the line it added to `init.lua`.
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

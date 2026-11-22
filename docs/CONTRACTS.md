@@ -267,6 +267,27 @@ impl Rex {
     pub fn program_status(&self, block_id: &str) -> Result<serde_json::Value, Error>;
     pub fn host_id(&self) -> Result<String, Error>;    // server.status
 }
+impl Rex {
+    pub fn ask(&self, pick: &prompt::Pick, should_stop: &dyn Fn() -> bool) -> Result<prompt::Answer, Error>;  // `rex api call client.action` running axel_ask; killing it closes the prompt
+}
+pub mod prompt {   // questions in every connected Rex app (rex.ui, API revision 17)
+    pub const ACTION: &str = "axel_ask"; pub const MODULE_FILE: &str = "axel.lua"; pub const MODULE_SOURCE: &str;
+    pub const ITEMS_MAX: usize = 2_000; pub const TIMEOUT_SECONDS_MAX: u32 = 3_600; pub const TITLE_CHARS_MAX: usize = 200;
+    pub struct Item { pub id: String, pub title: String, pub subtitle: Option<String> }
+    pub enum Selection { Single { allow_other: bool }, Multiple }
+    pub struct Pick { pub title: String, pub placeholder: Option<String>, pub items: Vec<Item>, pub selection: Selection, pub timeout_seconds: u32 }
+    pub enum Answer { Ids(Vec<String>), Text(String), Unanswered(Unanswered) }
+    pub enum Unanswered { Cancelled, Timeout, NoClient, Unsupported, Busy, Withdrawn, NotInstalled, Failed(String) }
+    impl Unanswered { pub fn is_unreachable(&self) -> bool; }   // NoClient | Unsupported | NotInstalled | Failed
+    pub fn action_args(pick: &Pick) -> serde_json::Value;       // {"action":"axel_ask","args":{...}}, absent fields left out
+    pub fn parse_result(result: &serde_json::Value, pick: &Pick) -> Result<Answer, String>;   // refuses ids not offered
+    pub fn config_dir() -> Option<PathBuf>;                     // dir of $REX_CONFIG, else $XDG_CONFIG_HOME/rex, else ~/.config/rex
+    pub struct Installed { pub is_module_written: bool, pub is_init_changed: bool }
+    pub fn install(dir: &Path) -> std::io::Result<Installed>;   // writes axel.lua, fenced require("axel") in init.lua; idempotent
+    pub fn remove(dir: &Path) -> std::io::Result<bool>;
+    pub fn is_installed(dir: &Path) -> bool;
+    pub fn reload() -> Result<(), Error>;                       // rex config reload
+}
 pub struct Layer { pub layer_id: String, pub block_ids: Vec<String> }
 pub struct Window { pub window_id: String, pub block_ids: Vec<String> }
 pub mod osc {   // OSC 7501 program status, rev 0.4
@@ -289,6 +310,9 @@ pub struct Deps<'a> { pub store: &'a axel_store::Store, pub keystore: &'a axel_i
 // theme::agent_color(Option<AgentColor>), theme::state_color(StatusState) and model::state_glyph(StatusState) match on the enums.
 pub fn run(deps: Deps, initial: Screen) -> anyhow::Result<Outcome>;   // owns the terminal (raw mode + alt screen), restores on exit/panic
 pub enum StreamInput { Text(String), Controls /* ^D */, Terminal /* ^T */ }
+pub type AskFn<'a> = dyn Fn(&axel_rex::prompt::Pick, &dyn Fn() -> bool /* stop waiting */) -> anyhow::Result<axel_rex::prompt::Answer> + 'a;
+pub enum RexQuestion { Answered, Left, Unreachable(String) }
+pub fn run_rex_question(deps: &Deps, thread_id: &str, item_id: &str, ask: &AskFn) -> anyhow::Result<RexQuestion>;
 pub type RedirectInputFn<'a> = dyn Fn(StreamInput) -> anyhow::Result<()> + 'a;
 pub fn run_stream(store: &axel_store::Store, owner_pk: &str, thread_id: &str, redirect_input: Option<&RedirectInputFn<'_>>) -> anyhow::Result<()>;
 // With redirect_input, the stream reads plain typing and bracketed paste without

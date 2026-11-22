@@ -24,6 +24,7 @@ pub mod manage;
 pub mod mention;
 pub mod model;
 pub mod picker;
+mod rex_question;
 pub mod theme;
 pub mod thread;
 pub mod tools;
@@ -31,6 +32,7 @@ pub mod util;
 pub mod view;
 
 pub use compose::{run_answer, run_compose};
+pub use rex_question::{AskFn, RexQuestion, run_rex_question};
 
 /// How tall the launcher's prompt pane should be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

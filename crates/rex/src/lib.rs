@@ -16,8 +16,10 @@
 //! # Ok::<(), axel_rex::Error>(())
 //! ```
 
+pub mod control;
 pub mod osc;
 pub mod payload;
+pub mod prompt;
 
 use std::path::Path;
 use std::process::Command;
@@ -79,6 +81,12 @@ pub enum Error {
     /// A caller-side argument problem, detected before anything runs.
     #[error("invalid argument: {0}")]
     Invalid(String),
+    /// The control connection couldn't open, or dropped.
+    #[error("rex control connection: {0}")]
+    Connection(String),
+    /// Rex didn't answer in time.
+    #[error("rex didn't answer in time")]
+    Timeout,
 }
 
 /// Runs the `rex` CLI with `args` (everything after the program name) and
@@ -644,6 +652,80 @@ impl Rex {
     pub fn host_id(&self) -> Result<String, Error> {
         str_field(&self.server_status()?, "server.status", "host_id")
     }
+
+    /// Put `pick` to the owner in every connected Rex app and wait for the
+    /// first answer. `should_stop` is checked every [`ASK_POLL_MS`]; when it
+    /// says yes, Axel stops waiting and Rex closes the prompt everywhere.
+    pub fn ask(&self, pick: &prompt::Pick, should_stop: &dyn Fn() -> bool) -> Result<prompt::Answer, Error> {
+        let request = prompt::action_args(pick);
+        let wait_seconds = pick.timeout_seconds + ASK_SLACK_SECONDS;
+        let mut cmd = Command::new(program());
+        cmd.args(["--timeout", &format!("{wait_seconds}s"), "api", "call", "client.action", &request.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(server) = &self.env.server {
+            cmd.env("REX_SERVER", server);
+        }
+        let spawn_error = |source| Error::Spawn { program: program(), source };
+        let mut child = cmd.spawn().map_err(spawn_error)?;
+        let Some(out) = wait_or_stop(&mut child, std::time::Duration::from_secs(u64::from(wait_seconds)), should_stop).map_err(spawn_error)? else {
+            return Ok(prompt::Answer::Unanswered(prompt::Unanswered::Withdrawn));
+        };
+        let method = "client.action".to_string();
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            // Rex's wording: "the configuration file defines no action \"axel_ask\"".
+            if stderr.contains("defines no action") {
+                return Ok(prompt::Answer::Unanswered(prompt::Unanswered::NotInstalled));
+            }
+            return Err(Error::Rex { method, stderr });
+        }
+        let reply: Value = serde_json::from_slice(&out.stdout).map_err(|source| Error::Json { method: method.clone(), source })?;
+        let result = reply.get("result").ok_or(Error::Shape { method: method.clone(), field: "result" })?;
+        prompt::parse_result(result, pick).map_err(|why| Error::Rex { method, stderr: why })
+    }
+}
+
+/// How long [`Rex::ask`] waits past the prompt's own timeout before it gives
+/// up on Rex: the action's own 30 s budget, which prompt time doesn't count.
+const ASK_SLACK_SECONDS: u32 = 30;
+/// How often [`Rex::ask`] checks whether to stop waiting. A fifth of a second
+/// is quicker than a person notices and costs one closure call.
+const ASK_POLL_MS: u64 = 200;
+
+/// Wait for `child` until it exits, `limit` passes, or `should_stop` says so.
+/// `None` when stopped or past the limit: the child is killed, which makes
+/// Rex close its prompt. Output is drained on threads so it can't block.
+fn wait_or_stop(child: &mut std::process::Child, limit: std::time::Duration, should_stop: &dyn Fn() -> bool) -> std::io::Result<Option<Output>> {
+    use std::io::Read;
+    let drain = |pipe: Option<Box<dyn Read + Send>>, max: u64| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(pipe) = pipe {
+                // A read error leaves what was read; the exit status still decides.
+                let _ = pipe.take(max).read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), STDOUT_BYTES_MAX);
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>), STDERR_BYTES_MAX);
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if should_stop() || std::time::Instant::now() >= deadline {
+            // Killing an exited child fails harmlessly; wait reaps it either way.
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(ASK_POLL_MS));
+    };
+    let join = |handle: std::thread::JoinHandle<Vec<u8>>| handle.join().unwrap_or_default();
+    Ok(Some(Output { status, stdout: join(stdout), stderr: join(stderr), is_stdout_cut: false }))
 }
 
 fn str_field(v: &Value, method: &str, field: &'static str) -> Result<String, Error> {

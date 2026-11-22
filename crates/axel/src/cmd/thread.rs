@@ -60,6 +60,11 @@ pub fn run(cmd: ThreadCommand) -> Result<()> {
             drop(ctx);
             super::ui::run_answer(&t.id, &item)
         }
+        ThreadCommand::Ask { thread, item } => {
+            let t = resolve(&ctx, &thread)?;
+            drop(ctx);
+            super::ui::run_ask(&t.id, &item)
+        }
         ThreadCommand::Open { thread } => {
             let t = resolve(&ctx, &thread)?;
             drop(ctx);
@@ -67,6 +72,7 @@ pub fn run(cmd: ThreadCommand) -> Result<()> {
         }
         ThreadCommand::Resume { thread, agent } => resume(&ctx, &thread, agent),
         ThreadCommand::Attach { thread, project, worktree } => attach(&ctx, &thread, project, worktree),
+        ThreadCommand::Questions { json } => questions(&ctx, json),
         ThreadCommand::Ls { json, all } => list(&ctx, json, all),
         ThreadCommand::Show { thread } => show(&ctx, &thread),
         ThreadCommand::Stop { thread } => {
@@ -191,6 +197,42 @@ fn attach(ctx: &Ctx, thread: &str, project: std::path::PathBuf, worktree: Option
     };
     ctx.store.attach_project(&owner, &t.id, key.as_deref(), &path, &ws)?;
     println!("{}", t!("attached {path} to {title}", path = path.display(), title = t.title));
+    Ok(())
+}
+
+/// One question waiting for the owner, as `axel thread questions --json`
+/// prints it (Rex's palette reads it, `axel.lua`).
+#[derive(serde::Serialize)]
+struct WaitingQuestion {
+    thread_id: String,
+    thread_title: String,
+    item_id: String,
+    agent: String,
+    prompt: String,
+}
+
+fn questions(ctx: &Ctx, json: bool) -> Result<()> {
+    let mut waiting = Vec::new();
+    for item in ctx.store.pending_items(None)? {
+        if item.kind != axel_store::ItemKind::Question {
+            continue;
+        }
+        let thread_title = ctx.store.get_thread(&item.thread_id)?.map(|t| t.title).unwrap_or_default();
+        let agent_pubkey = ctx.store.get_session(&item.session_id)?.map(|s| s.agent_pubkey).unwrap_or_default();
+        let agent = ctx.store.agent_by_pubkey(&agent_pubkey)?.map(|a| a.name).unwrap_or_else(|| t!("an agent").to_string());
+        let prompt = item.content.get("title").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        waiting.push(WaitingQuestion { thread_id: item.thread_id, thread_title, item_id: item.id, agent, prompt });
+    }
+    if json {
+        println!("{}", serde_json::to_string(&waiting)?);
+        return Ok(());
+    }
+    if waiting.is_empty() {
+        println!("{}", t!("no agent is waiting for an answer"));
+    }
+    for q in &waiting {
+        println!("@{}  {}  · {}", q.agent, q.prompt, q.thread_title);
+    }
     Ok(())
 }
 

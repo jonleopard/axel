@@ -16,6 +16,7 @@ mod manage;
 mod policy;
 mod process_control;
 mod reconcile;
+mod rex_link;
 mod session;
 mod setup;
 mod skills;
@@ -123,6 +124,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::OpenUrl { url }) => links::open_url(&url),
+        Some(Command::Rex { command: crate::cli::RexCommand::Setup { remove } }) => ui::rex_setup(remove),
         Some(Command::Host { command }) => match command {
             crate::cli::HostCommand::Add { label, ssh, install } => host::add(&label, ssh.as_deref(), install),
             crate::cli::HostCommand::Ls => host::list(),

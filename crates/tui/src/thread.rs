@@ -37,6 +37,12 @@ pub enum SendCommand {
     Answer { item_id: String, option_id: String },
 }
 
+/// The option id that answers a multi-select question with `ids`, as the
+/// host decodes it (`answer:multi:<JSON array>`, `docs/CONTRACTS.md`).
+pub(crate) fn multi_answer_id(ids: &[&str]) -> String {
+    format!("answer:multi:{}", serde_json::to_string(ids).expect("a list of strings serializes"))
+}
+
 /// Reply from a managed session's host (mirrors `axel_acp::socket::Reply`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendReply {
@@ -1185,7 +1191,7 @@ impl ThreadView {
                     self.set_status(format!("select {min}–{max} options before confirming")); return ThreadAction::None;
                 }
                 let ids:Vec<_>=selected.iter().map(|o|o.id.as_str()).collect();
-                (format!("answer:multi:{}",serde_json::to_string(&ids).expect("string ids")),format!("{} selections",ids.len()))
+                (multi_answer_id(&ids),format!("{} selections",ids.len()))
             }
         } else { (opt.id,opt.label) };
         let (session_id, item_id) = (it.session_id.clone(), it.id.clone());

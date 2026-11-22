@@ -1622,3 +1622,65 @@
   zh-Hans: "是，在本会话中"
 "Permissions: {permissions}":
   zh-Hans: "权限：{permissions}"
+"an agent":
+  zh-Hans: "一个智能体"
+"Choose {min} to {max} · {thread}":
+  zh-Hans: "选择 {min} 到 {max} 项 · {thread}"
+"Or type another answer · {thread}":
+  zh-Hans: "或输入其他回答 · {thread}"
+"choose {min} to {max}":
+  zh-Hans: "选择 {min} 到 {max} 项"
+"questions through Rex need Rex":
+  zh-Hans: "通过 Rex 提问需要 Rex"
+"Rex couldn't ask ({why}); opening the answer pane":
+  zh-Hans: "Rex 无法提问（{why}）；正在打开回答面板"
+"no Rex configuration directory: HOME is not set":
+  zh-Hans: "找不到 Rex 配置目录：未设置 HOME"
+"installing axel.lua in {dir}":
+  zh-Hans: "正在把 axel.lua 安装到 {dir}"
+"removing axel.lua from {dir}":
+  zh-Hans: "正在从 {dir} 移除 axel.lua"
+"removed {file}; Rex reloaded its configuration":
+  zh-Hans: "已移除 {file}；Rex 已重新加载配置"
+"nothing to remove in {dir}":
+  zh-Hans: "{dir} 中没有可移除的内容"
+"installed {file}; agents' questions now reach every Rex app":
+  zh-Hans: "已安装 {file}；智能体的问题现在会出现在每个 Rex 应用中"
+"{file} is up to date":
+  zh-Hans: "{file} 已是最新"
+"Rex questions":
+  zh-Hans: "Rex 提问"
+"on every Rex app, Mac and iPhone":
+  zh-Hans: "出现在每个 Rex 应用中，Mac 和 iPhone 都有"
+"in a pane: {error}":
+  zh-Hans: "在面板中：{error}"
+"no agent is waiting for an answer":
+  zh-Hans: "没有智能体在等待回答"
+"Axel: Which thread":
+  zh-Hans: "Axel：哪个话题"
+"Name the thread this composer writes to.":
+  zh-Hans: "说出这个输入框所属的话题。"
+"Axel: Stop the agent's turn":
+  zh-Hans: "Axel：停止智能体的本轮"
+"Cancel the turn an agent is running on this thread.":
+  zh-Hans: "取消智能体在此话题上正在进行的一轮。"
+"Axel: Thread controls":
+  zh-Hans: "Axel：话题控制"
+"Open the thread's sessions, spend and controls.":
+  zh-Hans: "打开话题的会话、花费和控制。"
+"Axel: Agent log":
+  zh-Hans: "Axel：智能体日志"
+"Show or hide the agent's session pane.":
+  zh-Hans: "显示或隐藏智能体的会话面板。"
+"Axel: Focus the composer":
+  zh-Hans: "Axel：聚焦输入框"
+"Put the cursor in this thread's composer.":
+  zh-Hans: "把光标放到此话题的输入框中。"
+"Axel offers no action {action}":
+  zh-Hans: "Axel 没有提供操作 {action}"
+"the thread is gone":
+  zh-Hans: "话题已不存在"
+"no agent is working on this thread":
+  zh-Hans: "此话题上没有智能体在工作"
+"no agent on this thread has a pane":
+  zh-Hans: "此话题上没有智能体拥有面板"
