@@ -5,7 +5,7 @@ description: Rex, Axel, and the harness your agents run.
 
 ## Requirements
 
-- **macOS** (Linux works for the CLI; the floating panes need Rex).
+- **macOS**, or **Linux** with glibc (x86_64 or arm64). The floating panes need Rex.
 - **[Rex](https://www.superlogical.com/rex)**, the terminal Axel lives in. Outside Rex, Axel
   runs the same interface inline in your terminal.
 - **A harness**, installed and logged in: [Claude Code](https://claude.ai/code),
@@ -19,10 +19,14 @@ curl -fsSL https://axel.md/install | sh
 axel
 ```
 
-The script downloads the latest release for your Mac, checks its sha256 and puts `axel` in
+The script downloads the latest release for your machine, checks its sha256 and puts `axel` in
 `~/.local/bin` (set `AXEL_INSTALL_DIR` to choose another place). Every commit on `main`
 that passes CI is released. Run `axel update` to update using the same script, or pass a version:
 `curl -fsSL https://axel.md/install | sh -s -- 0.3.80`.
+
+On Linux the binary needs the system's libdbus (`libdbus-1`, present on desktop
+distributions). Releases made before Linux binaries were added can't be installed there,
+so a version passed on Linux has to be a newer one.
 
 The composer checks for releases in the background, sharing a six-hour cache across
 threads. It suggests `axel update` when a release is more than ten patches ahead,
