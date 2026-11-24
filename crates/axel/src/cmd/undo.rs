@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use axel_i18n::t;
 use axel_acp::checkpoint::{self, REFS};
 use axel_store::{ChangeStatus, FileChange, TurnChanges};
 
@@ -55,7 +56,7 @@ pub fn blocked_reason(ctx: &Ctx, session_id: &str) -> Result<Option<String>> {
     }
     let mid_turn = matches!(s.state, SessionState::Running | SessionState::Blocked | SessionState::Paused)
         || ctx.store.status(session_id)?.is_some_and(|st| matches!(st.state, StatusState::Working | StatusState::Blocked));
-    Ok(mid_turn.then(|| "the agent is mid-turn; wait for it to finish".to_string()))
+    Ok(mid_turn.then(|| t!("the agent is mid-turn; wait for it to finish").to_string()))
 }
 
 /// Reverse the turn's change in `dir`'s working tree (see the module doc).
@@ -114,11 +115,9 @@ pub fn restore(dir: &Path, thread_id: &str, c: &TurnChanges) -> Result<Undone> {
     for f in files_of(c) {
         let full = root.join(&f.path);
         match f.status {
-            ChangeStatus::Added => {
-                let _ = std::fs::remove_file(&full);
-            }
+            ChangeStatus::Added => remove_if_present(&full)?,
             ChangeStatus::Renamed => {
-                let _ = std::fs::remove_file(&full);
+                remove_if_present(&full)?;
                 let old = f.old_path.clone().unwrap_or_else(|| f.path.clone());
                 write_from(&root, &c.before, &old)?;
             }
@@ -127,6 +126,15 @@ pub fn restore(dir: &Path, thread_id: &str, c: &TurnChanges) -> Result<Undone> {
         files.push(f.path.clone());
     }
     Ok(Undone { files, snapshot_ref })
+}
+
+/// Remove a file the turn added; one already gone is what we wanted.
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// `path` as it is in `commit`, written into the working tree.
@@ -200,29 +208,30 @@ pub fn run(thread: &str, session: Option<&str>, turn: Option<i64>, restore_files
     let p = super::diff::pick(&ctx, &t.id, session, turn)?;
     let ordinal = p.turn.summary.ordinal;
     if let Some(why) = blocked_reason(&ctx, &p.turn.session_id)? {
-        bail!("can't undo turn {ordinal} of {}: {why}", p.agent);
+        bail!("{}", t!("can't undo turn {n} of {agent}: {why}", n = ordinal, agent = p.agent, why = why));
     }
     let files: Vec<String> = files_of(&p.changes).iter().map(|f| f.path.clone()).collect();
     if files.is_empty() {
-        println!("turn {ordinal} of {} changed no files", p.agent);
+        println!("{}", t!("turn {n} of {agent} changed no files", n = ordinal, agent = p.agent));
         return Ok(());
     }
-    let dir = super::links::thread_dir(&ctx, &t.id).context("this machine has no checkout of the thread's project")?;
+    let dir = super::links::thread_dir(&ctx, &t.id).context(t!("this machine has no checkout of the thread's project"))?;
     if !yes {
         use std::io::Write;
-        print!(
-            "{} turn {ordinal} of {}: {} file{} ({})? [y/N] ",
-            if restore_files { "restore the files of" } else { "undo" },
-            p.agent,
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
-            files.join(", ")
-        );
+        let (n, list) = (files.len(), files.join(", "));
+        let question = match (restore_files, n) {
+            (true, 1) => t!("restore the files of turn {turn} of {agent}: 1 file ({files})?", turn = ordinal, agent = p.agent, files = list),
+            (true, _) => t!("restore the files of turn {turn} of {agent}: {n} files ({files})?", turn = ordinal, agent = p.agent, n = n, files = list),
+            (false, 1) => t!("undo turn {turn} of {agent}: 1 file ({files})?", turn = ordinal, agent = p.agent, files = list),
+            (false, _) => t!("undo turn {turn} of {agent}: {n} files ({files})?", turn = ordinal, agent = p.agent, n = n, files = list),
+        };
+        // The answer stays y or yes, as the [y/N] hint says, in every language.
+        print!("{question} [y/N] ");
         std::io::stdout().flush()?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("left as is");
+            println!("{}", t!("left as is"));
             return Ok(());
         }
     }
@@ -233,21 +242,26 @@ pub fn run(thread: &str, session: Option<&str>, turn: Option<i64>, restore_files
             UndoResult::Done(d) => (d, false),
             UndoResult::Conflicts(files) => {
                 bail!(
-                    "later work overlaps {}: nothing changed. `axel thread undo {} --turn {ordinal} --restore` rewrites the turn's files to how they were before it",
-                    files.join(", "),
-                    &t.id[..12.min(t.id.len())]
+                    "{}",
+                    t!(
+                        "later work overlaps {files}: nothing changed. `axel thread undo {thread} --turn {n} --restore` rewrites the turn's files to how they were before it",
+                        files = files.join(", "),
+                        thread = &t.id[..12.min(t.id.len())],
+                        n = ordinal
+                    )
                 );
             }
         }
     };
-    println!(
-        "{}: {} (snapshot of the tree before: {})",
-        if restored { "restored" } else { "undone" },
-        done.files.join(", "),
-        done.snapshot_ref
-    );
+    let (files, snapshot) = (done.files.join(", "), &done.snapshot_ref);
+    let line = if restored {
+        t!("restored: {files} (snapshot of the tree before: {snapshot})", files = files, snapshot = snapshot)
+    } else {
+        t!("undone: {files} (snapshot of the tree before: {snapshot})", files = files, snapshot = snapshot)
+    };
+    println!("{line}");
     if let Err(e) = notify(&ctx, &t.id, &p.turn.session_id, ordinal, &done.files, restored) {
-        eprintln!("axel: telling the agent: {e:#}");
+        eprintln!("axel: {}", t!("telling the agent: {error}", error = format!("{e:#}")));
     }
     Ok(())
 }
@@ -274,26 +288,63 @@ fn git_out(dir: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
-/// Write `input` to the child's stdin and collect its output, within a minute.
+/// How long one git command may take.
+const GIT_TIMEOUT_SECS: u64 = 60;
+/// The most output one git command may give: a turn's binary patch, which
+/// a turn that rewrote large files makes big, but never this big.
+const GIT_OUTPUT_BYTES_MAX: u64 = 256 * 1024 * 1024;
+/// How often a running git is checked for having finished.
+const GIT_POLL_MS: u64 = 10;
+
+/// Write `input` to the child's stdin and collect its output, within
+/// [`GIT_TIMEOUT_SECS`].  Its output is read as it comes, so a command that
+/// writes more than a pipe holds doesn't stall until the deadline.
 fn feed(mut child: std::process::Child, input: &[u8]) -> Result<std::process::Output> {
     if let Some(mut stdin) = child.stdin.take() {
         let data = input.to_vec();
         std::thread::spawn(move || {
             use std::io::Write;
+            // A git that exits without reading all of it says why in its status.
             let _ = stdin.write_all(&data);
         });
     }
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(child.wait_with_output()?);
+    let stdout = child.stdout.take().map(|out| std::thread::spawn(move || read_bounded(out)));
+    let stderr = child.stderr.take().map(|err| std::thread::spawn(move || read_bounded(err)));
+    let deadline = Instant::now() + Duration::from_secs(GIT_TIMEOUT_SECS);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if Instant::now() > deadline {
+            // Already failing: a kill that doesn't land leaves a git that ends on its own.
             let _ = child.kill();
-            bail!("git took longer than a minute");
+            let _ = child.wait();
+            bail!("git took longer than {GIT_TIMEOUT_SECS} seconds");
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(GIT_POLL_MS));
+    };
+    let collect = |reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>| -> Result<Vec<u8>> {
+        match reader {
+            Some(r) => r.join().map_err(|_| anyhow::anyhow!("reading git's output panicked"))?.map_err(Into::into),
+            None => Ok(Vec::new()),
+        }
+    };
+    let stdout = collect(stdout)?;
+    if u64::try_from(stdout.len()).unwrap_or(u64::MAX) > GIT_OUTPUT_BYTES_MAX {
+        bail!("git gave more than {GIT_OUTPUT_BYTES_MAX} bytes of output");
     }
+    Ok(std::process::Output { status, stdout, stderr: collect(stderr)? })
+}
+
+/// Read a pipe to its end, keeping at most one byte past
+/// [`GIT_OUTPUT_BYTES_MAX`] (so the caller can tell it was cut) and draining
+/// the rest, so the writer never blocks on it.
+fn read_bounded(mut pipe: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    (&mut pipe).take(GIT_OUTPUT_BYTES_MAX + 1).read_to_end(&mut buf)?;
+    std::io::copy(&mut pipe, &mut std::io::sink())?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -303,6 +354,20 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&git_out(dir, args, b"").unwrap()).trim().to_string()
+    }
+
+    #[test]
+    fn a_command_with_more_output_than_a_pipe_holds_finishes_at_once() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "head -c 1000000 /dev/zero"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let out = feed(child, b"").unwrap();
+        assert_eq!(out.stdout.len(), 1_000_000);
+        assert!(started.elapsed() < Duration::from_secs(10), "read as it comes, not at the deadline");
     }
 
     fn repo() -> tempfile::TempDir {

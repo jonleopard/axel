@@ -89,7 +89,8 @@ impl WorkspaceConfig {
     pub fn parse(text: &str) -> Result<WorkspaceConfig, Error>;
     pub fn template(workspace_name: &str) -> String;
 }
-pub struct Skill { pub name: String, pub path: PathBuf, pub description: Option<String> }
+pub struct Skill { pub name: String, pub path: PathBuf, pub description: Option<String>, pub always: bool /* frontmatter `always: true` */ }
+pub fn standing_skills(global: Option<&Path>) -> Result<Vec<Skill>, Error>;  // global skills with always: true, inlined in every session's system prompt
 pub fn find_all_skills(sources: &[SkillSource], global: Option<&Path>) -> Result<indexmap::IndexMap<String, Skill>, Error>;  // directories only
 pub fn find_skills(roots: &[remote::SkillRoot], global: Option<&Path>) -> Result<indexmap::IndexMap<String, Skill>, Error>;  // dirs, then remote, then global
 pub mod remote {   // AXEL.lock pins each remote source to a commit; cache <cache>/github/<owner>/<repo>/<commit>/
@@ -171,7 +172,11 @@ impl Store {
     pub fn touch_agent(&self, pk: &str) -> Result<(), Error>; pub fn archive_agent(&self, pk: &str) -> Result<(), Error>;
     pub fn touch_agent(&self, pk: &str) -> Result<(), Error>; pub fn rename_agent(&self, pk: &str, name: &str) -> Result<(), Error>;   // key, policy, history stay; running sessions keep the old name
     pub fn touch_agent(&self, pk: &str) -> Result<(), Error>; pub fn set_agent_profile(&self, pk: &str, skills: Option<&[String]>, prompt: Option<&str>, color: Option<AgentColor>) -> Result<(), Error>;   // each Some replaces; "" clears the prompt
+    pub fn set_agent_effort(&self, pk: &str, effort: Option<Effort>) -> Result<(), Error>;   // None: the harness's own default; sessions started afterwards see it
     pub fn known_identity_name(&self, pubkey: &str) -> Result<Option<String>, Error>;   // agent name, or participant display if known
+    pub fn set_plan_limit(&self, harness: &Harness, window: LimitWindow, used_pct: f64, resets_at: Option<i64>) -> Result<(), Error>;   // replaces that window's row; used_pct clamped to 0–100
+    pub fn clear_plan_limit(&self, harness: &Harness, window: LimitWindow) -> Result<(), Error>;   // the plan no longer has that window (Antigravity's `disabled`)
+    pub fn plan_limits(&self) -> Result<Vec<PlanLimit>, Error>;   // by harness, then 5h, wk, mo
 }
 
 pub struct Appended { pub inserted: bool, pub projected: bool, pub rejected_reason: Option<String> }
@@ -187,9 +192,16 @@ pub struct Appended { pub inserted: bool, pub projected: bool, pub rejected_reas
 pub enum BlockedKind { Permission, Question, Auth }
 pub enum Relationship { Fork, Subagent, Delegation }
 pub enum AgentColor { Purple, Yellow, Red, Green, Blue, Gray, Orange }                      // the TUI's seven agent colours, in cycle order
+pub enum Effort { Low, Medium, High, Xhigh, Max }                                           // how hard an agent's model thinks; an agent without one runs at its harness's default
 // Not Copy and no ALL: parsing never fails (anything that is not a builtin is Custom).  Serialised as the builtin name or the custom command.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)] pub enum Harness { #[default] Claude, Codex, Opencode, Custom(String) }
-impl Harness { pub const BUILTIN: [Harness; 3]; pub fn as_str(&self) -> &str; pub fn parse(s: &str) -> Harness; pub fn is_builtin(&self) -> bool; }   // FromStr<Err = Infallible>, Display, Serialize/Deserialize as a string
+impl Harness { pub const BUILTIN: [Harness; 3]; pub fn as_str(&self) -> &str; pub fn parse(s: &str) -> Harness; pub fn is_builtin(&self) -> bool; pub fn install(&self) -> &str; pub fn login(&self) -> String /* one-line hint shown when it isn't logged in */; }   // FromStr<Err = Infallible>, Display, Serialize/Deserialize as a string
+impl Harness {   // capabilities (ADR 0007)
+    pub fn native_effort(&self, effort: Effort) -> Option<&'static str>;                    // the harness CLI's own word for the level: claude and pi all five; codex and grok all but max; others None
+    pub fn pane_effort_args(&self, effort: Effort) -> Option<Vec<String>>;                  // claude --effort L; codex -c model_reasoning_effort=L; pi --thinking L; grok --reasoning-effort L; None = this pane cannot apply it
+    pub fn has_builtin_adapter(&self) -> bool;                                              // claude and codex: their ACP adapter is inside `axel` and takes the effort in `_meta.axel.effort`
+    pub fn plan_limits_command(&self) -> Option<(&'static [&'static str], &'static str)>;   // (args, plan prefix) when the harness CLI can be asked for plan limits (`agy` → `(["--print", "/usage"], "agy")`); others None
+}
 pub struct Thread { pub id: String, pub title: String, pub intent: String, pub state: ThreadState, pub created_by: String, pub parent_thread_id: Option<String>, pub relationship: Option<Relationship>, pub created_at: i64, pub updated_at: i64, pub done_at: Option<i64> }
 pub struct ThreadWorkspace { pub kind: WorkspaceKind, pub branch: Option<String>, pub worktree_path: Option<PathBuf> }
 pub struct ThreadProject { pub thread_id: String, pub repo_key: Option<String>, pub path_hint: PathBuf, pub workspace: ThreadWorkspace, pub local_project_id: Option<String> /* resolved on this replica by repo_key or path */, pub added_at: i64 }
@@ -202,13 +214,38 @@ pub struct Status { pub session_id: String, pub thread_id: String, pub state: St
 pub struct Usage { pub session_id: String, pub input_tokens: i64, pub output_tokens: i64, pub cache_read_tokens: i64, pub cache_write_tokens: i64, pub turns: i64, pub cost_usd_est: f64, pub updated_at: i64 }
 #[derive(Default)] pub struct UsageDelta { .. as before .. }
 pub struct UsageSample { pub session_id: String, pub at: i64, pub input_tokens: i64, pub output_tokens: i64 }
+pub enum LimitWindow { FiveHour, Week, Month }   // "five_hour", "week", "month"; short(): 5h, wk, mo
+pub struct PlanLimit { pub harness: Harness, pub window: LimitWindow, pub used_pct: f64 /* 0–100 */, pub resets_at: Option<i64>, pub updated_at: i64 }   // local-only: the account signed in here
 pub struct ThreadSummary { pub thread: Thread, pub projects: Vec<ThreadProject>, pub participants: Vec<Participant>, pub sessions_total: i64, pub sessions_live: Vec<Session> /* non-ended */, pub agents: Vec<String>, pub environments: Vec<String /*labels*/>, pub usage: Usage, pub live: Option<Status> /* most urgent: blocked > error > working > done > idle */ }
 #[derive(Default)] pub struct ThreadFilter { pub states: Option<Vec<ThreadState>>, pub agent_pubkey: Option<String>, pub participant: Option<String>, pub repo_key: Option<String>, pub limit: Option<usize> }
 #[derive(Default)] pub struct SessionFilter { pub thread_id: Option<String>, pub agent_pubkey: Option<String>, pub environment_id: Option<String>, pub states: Option<Vec<SessionState>>, pub limit: Option<usize> }
-pub struct Agent { pub pubkey: String, pub name: String, pub harness: Harness, pub model: Option<String>, pub skills: Vec<String>, pub prompt: Option<String>, pub color: Option<AgentColor>, pub runtime_mode: RuntimeMode, pub auth_tag: Option<Vec<String>>, pub created_at: i64, pub last_seen_at: Option<i64>, pub archived_at: Option<i64> }
-#[derive(Default)] pub struct NewAgent { pub pubkey: String, pub name: String, pub harness: Harness, pub model: Option<String>, pub skills: Vec<String>, pub prompt: Option<String>, pub color: Option<AgentColor>, pub runtime_mode: RuntimeMode, pub auth_tag: Option<Vec<String>> }
+pub struct Agent { pub pubkey: String, pub name: String, pub harness: Harness, pub model: Option<String>, pub effort: Option<Effort>, pub skills: Vec<String>, pub prompt: Option<String>, pub color: Option<AgentColor>, pub runtime_mode: RuntimeMode, pub auth_tag: Option<Vec<String>>, pub created_at: i64, pub last_seen_at: Option<i64>, pub archived_at: Option<i64> }
+#[derive(Default)] pub struct NewAgent { pub pubkey: String, pub name: String, pub harness: Harness, pub model: Option<String>, pub effort: Option<Effort>, pub skills: Vec<String>, pub prompt: Option<String>, pub color: Option<AgentColor>, pub runtime_mode: RuntimeMode, pub auth_tag: Option<Vec<String>> }
 // Environment and Project(+repo_key) unchanged.
 ```
+
+Claude Code agents can select a machine-local configuration directory with
+`agent new --claude-config-dir DIR` or `agent edit --claude-config-dir DIR`.
+An explicit `default` selects Claude Code's ordinary login and settings.
+`agent edit --inherit-claude-config` removes the selection. Axel keys this
+setting by agent public key so renames preserve it. It applies to both pane
+and managed launches. Agents with an explicit selection run locally.
+
+An agent's reasoning effort is part of its record, beside its model: the nullable `agents.effort`
+column (schema v10; NULL, or text this build does not know, is the harness's default). Like the
+model it is in no envelope, so it changes no signature and no merge. It reaches a remote host in
+the job's agent profile (`JobAgent.effort`), and starting a job sets the agent's effort there to
+what the job carries (`None` clears it), even when the host already knows the agent (a host that
+predates the field ignores it, and a job without it, or with anything there that is not a level
+the host knows, reads as no effort).
+
+Plan limits (`plan_limits`, local-only, keyed `(harness, window)`) hold each plan window as a
+harness last reported it. Claude and Codex rows are keyed by their builtin harness. Harnesses with
+a plan-limits command (`Harness::plan_limits_command`, currently Antigravity) report independent
+quota buckets, so each bucket is a plan of its own, keyed `Harness::Custom("<prefix> <bucket>")`:
+`agy gemini` for "Gemini Models", `agy claude/gpt` for "Claude and GPT models" (lower case, without
+"models", "and" as `/`). The key is also the label the dashboard shows; no schema change. A window
+reported as `disabled` is cleared.
 
 Authorization in `append`: kind 100 → always (signer becomes owner). Other thread kinds → signer is a participant of `t`, or an agent whose `agents.auth_tag` owner is a participant, or (kinds 20/21/110–112) signer is one of this replica's own agents. Non-thread kinds (notes etc. without `t`) → always. Rejected envelopes are kept with `rejected_reason` and re-tried by `rebuild_projections`.
 
@@ -231,6 +268,27 @@ impl Rex {
     pub fn program_status(&self, block_id: &str) -> Result<serde_json::Value, Error>;
     pub fn host_id(&self) -> Result<String, Error>;    // server.status
 }
+impl Rex {
+    pub fn ask(&self, pick: &prompt::Pick, should_stop: &dyn Fn() -> bool) -> Result<prompt::Answer, Error>;  // `rex api call client.action` running axel_ask; killing it closes the prompt
+}
+pub mod prompt {   // questions in every connected Rex app (rex.ui, API revision 17)
+    pub const ACTION: &str = "axel_ask"; pub const MODULE_FILE: &str = "axel.lua"; pub const MODULE_SOURCE: &str;
+    pub const ITEMS_MAX: usize = 2_000; pub const TIMEOUT_SECONDS_MAX: u32 = 3_600; pub const TITLE_CHARS_MAX: usize = 200;
+    pub struct Item { pub id: String, pub title: String, pub subtitle: Option<String> }
+    pub enum Selection { Single { allow_other: bool }, Multiple }
+    pub struct Pick { pub title: String, pub placeholder: Option<String>, pub items: Vec<Item>, pub selection: Selection, pub timeout_seconds: u32 }
+    pub enum Answer { Ids(Vec<String>), Text(String), Unanswered(Unanswered) }
+    pub enum Unanswered { Cancelled, Timeout, NoClient, Unsupported, Busy, Withdrawn, NotInstalled, Failed(String) }
+    impl Unanswered { pub fn is_unreachable(&self) -> bool; }   // NoClient | Unsupported | NotInstalled | Failed
+    pub fn action_args(pick: &Pick) -> serde_json::Value;       // {"action":"axel_ask","args":{...}}, absent fields left out
+    pub fn parse_result(result: &serde_json::Value, pick: &Pick) -> Result<Answer, String>;   // refuses ids not offered
+    pub fn config_dir() -> Option<PathBuf>;                     // dir of $REX_CONFIG, else $XDG_CONFIG_HOME/rex, else ~/.config/rex
+    pub struct Installed { pub is_module_written: bool, pub is_init_changed: bool }
+    pub fn install(dir: &Path) -> std::io::Result<Installed>;   // writes axel.lua, fenced require("axel") in init.lua; idempotent
+    pub fn remove(dir: &Path) -> std::io::Result<bool>;
+    pub fn is_installed(dir: &Path) -> bool;
+    pub fn reload() -> Result<(), Error>;                       // rex config reload
+}
 pub struct Layer { pub layer_id: String, pub block_ids: Vec<String> }
 pub struct Window { pub window_id: String, pub block_ids: Vec<String> }
 pub mod osc {   // OSC 7501 program status, rev 0.4
@@ -252,11 +310,16 @@ pub struct Deps<'a> { pub store: &'a axel_store::Store, pub keystore: &'a axel_i
 // model rows (AgentRow, DashAgentRow, ThreadRow, StatusRow, NewAgentSpec) carry axel_store's Harness / RuntimeMode / AgentColor / StatusState, never their strings;
 // theme::agent_color(Option<AgentColor>), theme::state_color(StatusState) and model::state_glyph(StatusState) match on the enums.
 pub fn run(deps: Deps, initial: Screen) -> anyhow::Result<Outcome>;   // owns the terminal (raw mode + alt screen), restores on exit/panic
-pub type RedirectInputFn<'a> = dyn Fn(&str) -> anyhow::Result<()> + 'a;
+pub enum StreamInput { Text(String), Controls /* ^D */, Terminal /* ^T */ }
+pub type AskFn<'a> = dyn Fn(&axel_rex::prompt::Pick, &dyn Fn() -> bool /* stop waiting */) -> anyhow::Result<axel_rex::prompt::Answer> + 'a;
+pub enum RexQuestion { Answered, Left, Unreachable(String) }
+pub fn run_rex_question(deps: &Deps, thread_id: &str, item_id: &str, ask: &AskFn) -> anyhow::Result<RexQuestion>;
+pub type RedirectInputFn<'a> = dyn Fn(StreamInput) -> anyhow::Result<()> + 'a;
 pub fn run_stream(store: &axel_store::Store, owner_pk: &str, thread_id: &str, redirect_input: Option<&RedirectInputFn<'_>>) -> anyhow::Result<()>;
 // With redirect_input, the stream reads plain typing and bracketed paste without
 // echo or an alternate screen. The callback inserts it into the matching composer
-// and focuses that pane. Navigation keys stay inert; Ctrl+C exits the stream.
+// and focuses that pane. Ctrl+D / Ctrl+T open the thread controls / a terminal,
+// as in the composer (not shown in the stream). Other keys stay inert; Ctrl+C exits.
 // Dashboard screen (default): bashtop-style widgets — agents table (state glyph, name, harness, project, environment, tokens, sparkline from usage_samples, last event age), environments, tokens (1h series + totals + est cost), inbox panel. Enter on an agent → Outcome::FocusThread(thread_id) for its latest running thread; n → Launcher; i → Inbox; q → Quit. Refresh every 1s.
 ```
 The TUI creates new agents itself: `Keypair::generate()` → `keystore.put_agent` → `attest(&keystore.owner()?, &pk, "")` → `store.insert_agent`.
@@ -266,15 +329,43 @@ Inbox screen: list pending requests + recent messages for the owner and all agen
 
 The host prefers a model selector from ACP `configOptions` and sends
 `session/set_config_option`; adapters without one retain `session/set_model`.
+An agent's reasoning effort (`HostConfig::effort`) is applied when the session is created or
+loaded. Axel's own adapters take it in `_meta.axel.effort`: `claude-acp` starts Claude Code with
+`--effort LEVEL`, `codex-acp` adds `model_reasoning_effort` to the thread's config overrides
+(`thread/start` and `thread/resume`). That holds while the harness runs under that adapter
+(`Harness::has_builtin_adapter` and no `AXEL_ACP_CLAUDE` / `AXEL_ACP_CODEX` override naming another
+program); behind an override it is an ACP agent like any other and gets no `_meta.axel.effort`.
+Every other harness is asked through ACP `configOptions`: the select option with category
+`thought_level`, else one whose id or name says effort, reasoning or thinking (never one that says
+summary, and one offering effort levels before one that does not), gets
+`session/set_config_option`, and only with a value it advertises. When the level cannot be applied
+(no such option, value not offered, the request refused, Codex and `max`) the host says so in its
+log and as an item on the thread, and the session goes on. Under Axel's own adapter nothing is sent
+and the session runs at the harness default. Any other harness keeps the level it has, which need
+not be its default: the warning names the selector's `currentValue` ("it stays at high") when it
+reports one, and otherwise says its effort is unchanged. No effort set sends nothing.
+A pane gets `Harness::pane_effort_args` ahead of its other arguments; a pane that cannot take the
+level warns at launch and starts unchanged. `axel agent show` says what is knowable in advance.
 Standard `usage_update.used` is a context gauge, not billable token usage.
 Its cumulative USD cost is recorded once, without adding it again from Axel's
 usage extension or the prompt reply. Other currencies are not treated as USD.
+When `Harness::plan_limits_command` returns arguments and a plan prefix (Antigravity's
+`agy --print /usage`, which starts no agent turn and spends no quota), the host runs the harness's
+program with those arguments when the session starts and after each turn ends, at most once every
+five minutes per host process, as a task off the event loop, with a 10-second timeout, in an empty
+temporary directory. It parses the output inside the crate (tab-separated: bucket, window, percent
+remaining or `disabled`, reset time) and stores percent used under the capability's prefix. A
+failure (no program, timeout, non-zero exit) leaves stored rows as they are and the session goes
+on; a line that does not parse is skipped and the others are stored. An enabled window parses only
+with a remaining share from 0 to 100% and an RFC 3339 reset time; a `disabled` one has an empty
+reset. A read still in flight when the session stops is dropped, and the next such session reads at
+its start.
 
 ```rust
 // Adapter resolution (overridable by env AXEL_ACP_<HARNESS>=<command line>)
 pub fn adapter_command(harness: &axel_store::Harness) -> Vec<String>;  // claude → [axel, "claude-acp"], codex → [axel, "codex-acp"], custom "goose" → ["goose","acp"], Custom(cmd) → split(cmd)
 
-pub struct HostConfig { pub session_id: String, pub thread_id: String, pub agent_pubkey: String, pub cwd: PathBuf, pub harness: Harness, pub runtime_mode: RuntimeMode, pub disallowed_tools: Vec<String>, pub log_path: PathBuf, pub socket_path: PathBuf, pub env: Vec<(String,String)>, pub initial_prompt: Option<String>, pub resume_native_id: Option<String> }
+pub struct HostConfig { pub session_id: String, pub thread_id: String, pub agent_pubkey: String, pub cwd: PathBuf, pub harness: Harness, pub runtime_mode: RuntimeMode, pub disallowed_tools: Vec<String>, pub log_path: PathBuf, pub socket_path: PathBuf, pub env: Vec<(String,String)>, pub initial_prompt: Option<String>, pub resume_native_id: Option<String>, pub effort: Option<axel_store::Effort> }
 pub async fn run_host(cfg: HostConfig, store: axel_store::Store, signer: axel_identity::Keypair, out: impl std::io::Write + Send) -> anyhow::Result<()>;
 //   - spawns adapter, initialize (clientCapabilities fs read/write = true, terminal = false), session/new {cwd, mcpServers: []} (or session/load when resume_native_id and agent supports loadSession)
 //   - stores native session id via store.update_session(harness_session_id)

@@ -146,8 +146,8 @@ pub fn denied_reach(ctx: &Ctx, from: &str, recipients: &[String]) -> Result<Vec<
 /// One-line description of a reach, with names.
 pub fn reach_label(ctx: &Ctx, reach: &Reach) -> String {
     match reach {
-        Reach::Nobody => "nobody (only you)".into(),
-        Reach::Anyone => "any agent".into(),
+        Reach::Nobody => axel_i18n::t!("nobody (only you)").into(),
+        Reach::Anyone => axel_i18n::t!("any agent").into(),
         Reach::Only(pks) => pks.iter().map(|pk| name_of(ctx, pk)).collect::<Vec<_>>().join(", "),
     }
 }

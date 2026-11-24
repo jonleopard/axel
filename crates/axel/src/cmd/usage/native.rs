@@ -194,7 +194,7 @@ pub(super) fn start() {
         let Ok(store) = Store::open(&database) else { return };
         let mut scanner = Scanner::default();
         loop {
-            if let Err(e) = scanner.scan(&store,&claude,&codex) { eprintln!("axel: usage reconciliation: {e}"); }
+            if let Err(e) = scanner.scan(&store,&claude,&codex) { eprintln!("axel: {}", axel_i18n::t!("usage reconciliation: {error}", error = e)); }
             std::thread::sleep(Duration::from_secs(30));
         }
     });

@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use axel_acp::checkpoint::{self, Which};
 use axel_inbox::{EnvelopeBuilder, kind};
 use axel_rex::osc;
@@ -23,9 +23,18 @@ use serde_json::Value;
 use super::{Ctx, convert, launch, usage};
 use crate::cli::HarnessArg;
 
+/// The most a hook event may be.  Claude Code puts a tool's whole input and
+/// response in `PostToolUse` (a written file, a long command output), which
+/// stays well under this; more than that is not an event we can use.
+const HOOK_INPUT_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
 pub fn run(harness: HarnessArg, guard_only: bool) -> Result<()> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
+    std::io::stdin().take(HOOK_INPUT_BYTES_MAX + 1).read_to_string(&mut input)?;
+    if u64::try_from(input.len()).unwrap_or(u64::MAX) > HOOK_INPUT_BYTES_MAX {
+        bail!("hook event larger than {HOOK_INPUT_BYTES_MAX} bytes");
+    }
+    // Input that isn't JSON maps to no event: a hook must never break the harness.
     let event: Value = serde_json::from_str(input.trim()).unwrap_or(Value::Null);
     let (Ok(thread_id), Ok(session_id)) = (std::env::var("AXEL_THREAD"), std::env::var("AXEL_SESSION")) else {
         // Not launched by Axel: stay silent so hooks are harmless elsewhere.
@@ -38,18 +47,9 @@ pub fn run(harness: HarnessArg, guard_only: bool) -> Result<()> {
     let Some(session) = ctx.store.get_session(&session_id)? else { return Ok(()) };
     // Everything below is signed by the agent; without its key we can only watch.
     let Some(agent_kp) = agent_key(&ctx, &agent_pk)? else { return Ok(()) };
+    let hook = Hook { ctx: &ctx, agent_kp: &agent_kp, thread_id: &thread_id, session_id: &session_id };
 
-    // Learn the harness's own session id (for --resume) and transcript path once.
-    if harness == HarnessArg::Claude {
-        let hs = event.get("session_id").and_then(|s| s.as_str()).map(String::from);
-        let tp = event.get("transcript_path").and_then(|s| s.as_str()).map(String::from);
-        if (hs.is_some() && session.harness_session_id.is_none()) || (tp.is_some() && session.transcript_path.is_none()) {
-            ctx.store.update_session(&agent_kp, &session_id, &SessionUpdate { harness_session_id: hs, transcript_path: tp, ..Default::default() })?;
-        }
-    } else if let Some(tid) = event.get("thread-id").and_then(|t| t.as_str())
-        && session.harness_session_id.is_none() {
-            ctx.store.update_session(&agent_kp, &session_id, &SessionUpdate { harness_session_id: Some(tid.to_string()), ..Default::default() })?;
-        }
+    learn_harness_session(&hook, harness, &session, &event)?;
 
     // Guard first: a denied tool never changes status.
     if harness == HarnessArg::Claude && event.get("hook_event_name").and_then(|n| n.as_str()) == Some("PreToolUse")
@@ -76,25 +76,8 @@ pub fn run(harness: HarnessArg, guard_only: bool) -> Result<()> {
         HarnessArg::Claude => map_claude(&event),
         HarnessArg::Codex => map_codex(&event),
     };
-
     // Token usage, even for events we don't otherwise map.
-    match harness {
-        HarnessArg::Claude => {
-            let name = event.get("hook_event_name").and_then(|n| n.as_str()).unwrap_or("");
-            if matches!(name, "PostToolUse" | "Stop" | "SubagentStop" | "SessionEnd")
-                && let Some(path) = event.get("transcript_path").and_then(|p| p.as_str())
-                    && let Err(e) = usage::record_claude(&ctx.store, &agent_kp, &session_id, path, model.as_deref()) {
-                        eprintln!("axel: usage: {e}");
-                    }
-        }
-        HarnessArg::Codex => {
-            if let Some(tid) = event.get("thread-id").and_then(|t| t.as_str())
-                && let Err(e) = usage::record_codex(&ctx.store, &agent_kp, &session_id, tid, model.as_deref()) {
-                    eprintln!("axel: usage: {e}");
-                }
-        }
-    }
-
+    record_usage(&hook, harness, &event, model.as_deref());
     if harness == HarnessArg::Claude
         && let Err(e) = claude_turns(&ctx, &agent_kp, &session_id, &thread_id, &event)
     {
@@ -102,12 +85,79 @@ pub fn run(harness: HarnessArg, guard_only: bool) -> Result<()> {
     }
 
     let Some(m) = mapped else { return Ok(()) };
+    report_status(&hook, harness, &m)?;
+    if let Some(request_kind) = m.request {
+        ask_owner(&hook, &m, request_kind)?;
+    }
+    Ok(())
+}
 
+/// Who a hook speaks for: its session, thread and the agent's key.
+struct Hook<'a> {
+    ctx: &'a Ctx,
+    agent_kp: &'a axel_identity::Keypair,
+    thread_id: &'a str,
+    session_id: &'a str,
+}
+
+/// Learn the harness's own session id (for --resume) and transcript path once.
+fn learn_harness_session(hook: &Hook, harness: HarnessArg, session: &axel_store::Session, event: &Value) -> Result<()> {
+    let update = match harness {
+        HarnessArg::Claude => {
+            let harness_session = event.get("session_id").and_then(|s| s.as_str()).map(String::from);
+            let transcript = event.get("transcript_path").and_then(|s| s.as_str()).map(String::from);
+            let learns_session = harness_session.is_some() && session.harness_session_id.is_none();
+            let learns_transcript = transcript.is_some() && session.transcript_path.is_none();
+            if !(learns_session || learns_transcript) {
+                return Ok(());
+            }
+            SessionUpdate { harness_session_id: harness_session, transcript_path: transcript, ..Default::default() }
+        }
+        HarnessArg::Codex => {
+            let Some(codex_thread) = event.get("thread-id").and_then(|t| t.as_str()) else { return Ok(()) };
+            if session.harness_session_id.is_some() {
+                return Ok(());
+            }
+            SessionUpdate { harness_session_id: Some(codex_thread.to_string()), ..Default::default() }
+        }
+    };
+    hook.ctx.store.update_session(hook.agent_kp, hook.session_id, &update)?;
+    Ok(())
+}
+
+/// Add the turn's token usage from the harness's own records.  A failure is
+/// reported and the hook goes on: usage is bookkeeping, not the agent's work.
+fn record_usage(hook: &Hook, harness: HarnessArg, event: &Value, model: Option<&str>) {
+    let recorded = match harness {
+        HarnessArg::Claude => {
+            let name = event.get("hook_event_name").and_then(|n| n.as_str()).unwrap_or("");
+            let transcript = event.get("transcript_path").and_then(|p| p.as_str());
+            match transcript {
+                Some(path) if matches!(name, "PostToolUse" | "Stop" | "SubagentStop" | "SessionEnd") => {
+                    usage::record_claude(&hook.ctx.store, hook.agent_kp, hook.session_id, path, model)
+                }
+                _ => return,
+            }
+        }
+        HarnessArg::Codex => {
+            let Some(codex_thread) = event.get("thread-id").and_then(|t| t.as_str()) else { return };
+            usage::record_codex(&hook.ctx.store, hook.agent_kp, hook.session_id, codex_thread, model)
+        }
+    };
+    if let Err(e) = recorded {
+        eprintln!("axel: usage: {e}");
+    }
+}
+
+/// Mirror the mapped state to Rex's tab and record it, with the session state.
+fn report_status(hook: &Hook, harness: HarnessArg, m: &Mapped) -> Result<()> {
     let app = match harness {
         HarnessArg::Claude => "claude-code",
         HarnessArg::Codex => "codex",
     };
-    let title = ctx.store.get_thread(&thread_id)?.map(|t| t.title);
+    let title = hook.ctx.store.get_thread(hook.thread_id)?.map(|t| t.title);
+    // The tab indicator is cosmetic (and absent outside a terminal); the
+    // status recorded just below is what Axel reads.
     let _ = osc::emit_to_tty(&osc::Report {
         state: m.osc_state,
         id: None,
@@ -118,52 +168,56 @@ pub fn run(harness: HarnessArg, guard_only: bool) -> Result<()> {
         msg: Some(&m.msg),
     });
 
-    ctx.store.record_status(
-        &agent_kp,
-        &session_id,
+    hook.ctx.store.record_status(
+        hook.agent_kp,
+        hook.session_id,
         &StatusReport {
             state: convert::status_state(m.osc_state),
             kind: m.kind.map(convert::blocked_kind),
-            title: title.clone(),
+            title,
             msg: Some(m.msg.clone()),
             progress: None,
         },
     )?;
     if let Some(state) = m.session_state {
         if state == SessionState::Ended {
-            ctx.store.end_session(&agent_kp, &session_id, Some("harness exited"))?;
+            hook.ctx.store.end_session(hook.agent_kp, hook.session_id, Some("harness exited"))?;
         } else {
-            ctx.store.update_session(&agent_kp, &session_id, &SessionUpdate { state: Some(state), ..Default::default() })?;
+            hook.ctx.store.update_session(hook.agent_kp, hook.session_id, &SessionUpdate { state: Some(state), ..Default::default() })?;
         }
     }
+    Ok(())
+}
 
-    if let Some(req_kind) = m.request {
-        let owner_pk = ctx.owner()?.public().to_string();
-        let env = EnvelopeBuilder::new(req_kind, m.msg.clone())
-            .thread(&thread_id)
-            .session(&session_id)
-            .mention(&owner_pk)
-            .tag(vec!["k".into(), m.kind.unwrap_or(osc::Kind::Question).as_str().into()])
-            .sign(&agent_kp)?;
-        let request_id = env.id.clone();
-        ctx.store.post(&env)?;
+/// Post the question or permission request to the owner's inbox and, when
+/// the hook can answer for the harness, wait a while for the owner's reply.
+fn ask_owner(hook: &Hook, m: &Mapped, request_kind: u32) -> Result<()> {
+    let owner_pk = hook.ctx.owner()?.public().to_string();
+    let env = EnvelopeBuilder::new(request_kind, m.msg.clone())
+        .thread(hook.thread_id)
+        .session(hook.session_id)
+        .mention(&owner_pk)
+        .tag(vec!["k".into(), m.kind.unwrap_or(osc::Kind::Question).as_str().into()])
+        .sign(hook.agent_kp)?;
+    let request_id = env.id.clone();
+    hook.ctx.store.post(&env)?;
 
-        if m.can_decide {
-            let wait = launch::hook_wait_secs();
-            if wait > 0
-                && let Some(decision) = wait_for_reply(&ctx, &request_id, Duration::from_secs(wait))? {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "hookSpecificOutput": {
-                                "hookEventName": "PermissionRequest",
-                                "decision": { "behavior": decision }
-                            }
-                        })
-                    );
-                }
-        }
+    if !m.can_decide {
+        return Ok(());
     }
+    let wait_secs = launch::hook_wait_secs();
+    if wait_secs > 0
+        && let Some(decision) = wait_for_reply(hook.ctx, &request_id, Duration::from_secs(wait_secs))? {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PermissionRequest",
+                        "decision": { "behavior": decision.as_str() }
+                    }
+                })
+            );
+        }
     Ok(())
 }
 
@@ -204,17 +258,7 @@ fn claude_turns(ctx: &Ctx, agent_kp: &axel_identity::Keypair, session_id: &str, 
         }
         "PostToolUse" if mark.open => {
             mark.tool_calls += 1;
-            let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
-            if matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
-                && let Some(p) = event.get("tool_input").and_then(|i| ["file_path", "notebook_path"].iter().find_map(|k| i.get(k).and_then(Value::as_str)))
-            {
-                let p = PathBuf::from(p);
-                let full = if p.is_absolute() { p } else { cwd.as_deref().map_or(p.clone(), |d| d.join(&p)) };
-                let full = full.to_string_lossy().into_owned();
-                if !mark.authored.contains(&full) {
-                    mark.authored.push(full);
-                }
-            }
+            note_authored(&mut mark, event, cwd.as_deref());
         }
         "Stop" if mark.open => {
             let before = match (&mark.before_commit, &mark.before_tree) {
@@ -223,38 +267,10 @@ fn claude_turns(ctx: &Ctx, agent_kp: &axel_identity::Keypair, session_id: &str, 
             };
             let after = before.as_ref().and_then(|b| snapshot(mark.ordinal, Which::After, Some(b)));
             let changes = match (&before, &after, cwd.as_deref()) {
-                (Some(b), Some(a), Some(dir)) => {
-                    let authored: Vec<PathBuf> = mark.authored.iter().map(PathBuf::from).collect();
-                    match checkpoint::changes(dir, b, a, &authored) {
-                        Ok(mut c) => {
-                            c.between_turns = mark.last_after_tree.as_ref().is_some_and(|t| *t != b.tree);
-                            Some(c)
-                        }
-                        Err(e) => {
-                            eprintln!("axel: turn {} changes unknown: {e:#}", mark.ordinal);
-                            None
-                        }
-                    }
-                }
+                (Some(b), Some(a), Some(dir)) => turn_changes(&mark, dir, b, a),
                 _ => None,
             };
-            let assistant_text = event
-                .get("transcript_path")
-                .and_then(Value::as_str)
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|t| last_assistant_text(&t))
-                .unwrap_or_default();
-            let summary = TurnSummary {
-                ordinal: mark.ordinal,
-                user_text: mark.user_text.clone(),
-                assistant_text,
-                tool_calls: mark.tool_calls,
-                files_edited: mark.authored.len() as i64,
-                duration_ms: (chrono::Utc::now().timestamp_millis() - mark.started_at).max(0),
-                stop_reason: "end_turn".into(),
-                changes,
-            };
-            ctx.store.record_turn(agent_kp, session_id, &summary)?;
+            ctx.store.record_turn(agent_kp, session_id, &turn_summary(&mark, event, changes))?;
             mark.open = false;
             mark.before_commit = None;
             mark.before_tree = None;
@@ -265,6 +281,59 @@ fn claude_turns(ctx: &Ctx, agent_kp: &axel_identity::Keypair, session_id: &str, 
         _ => return Ok(()),
     }
     Ok(ctx.store.put_turn_mark(&mark)?)
+}
+
+/// Remember the file an edit tool names, as one the agent authored this turn.
+fn note_authored(mark: &mut TurnMark, event: &Value, cwd: Option<&std::path::Path>) {
+    let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    if !matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
+        return;
+    }
+    let Some(p) = event.get("tool_input").and_then(|i| ["file_path", "notebook_path"].iter().find_map(|k| i.get(k).and_then(Value::as_str))) else {
+        return;
+    };
+    let p = PathBuf::from(p);
+    let full = if p.is_absolute() { p } else { cwd.map_or(p.clone(), |d| d.join(&p)) };
+    let full = full.to_string_lossy().into_owned();
+    if !mark.authored.contains(&full) {
+        mark.authored.push(full);
+    }
+}
+
+/// What the turn changed between its two checkpoints; None (reported) when
+/// that can't be worked out.
+fn turn_changes(mark: &TurnMark, dir: &std::path::Path, before: &checkpoint::Snapshot, after: &checkpoint::Snapshot) -> Option<axel_store::TurnChanges> {
+    let authored: Vec<PathBuf> = mark.authored.iter().map(PathBuf::from).collect();
+    match checkpoint::changes(dir, before, after, &authored) {
+        Ok(mut c) => {
+            c.between_turns = mark.last_after_tree.as_ref().is_some_and(|t| *t != before.tree);
+            Some(c)
+        }
+        Err(e) => {
+            eprintln!("axel: turn {} changes unknown: {e:#}", mark.ordinal);
+            None
+        }
+    }
+}
+
+fn turn_summary(mark: &TurnMark, event: &Value, changes: Option<axel_store::TurnChanges>) -> TurnSummary {
+    // Without a readable transcript the turn is still recorded, only without its prose.
+    let assistant_text = event
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|t| last_assistant_text(&t))
+        .unwrap_or_default();
+    TurnSummary {
+        ordinal: mark.ordinal,
+        user_text: mark.user_text.clone(),
+        assistant_text,
+        tool_calls: mark.tool_calls,
+        files_edited: i64::try_from(mark.authored.len()).unwrap_or(i64::MAX),
+        duration_ms: chrono::Utc::now().timestamp_millis().saturating_sub(mark.started_at).max(0),
+        stop_reason: "end_turn".into(),
+        changes,
+    }
 }
 
 /// The most a hook's snapshot may take (the hook has 10 s in all).
@@ -430,15 +499,44 @@ fn post_note(ctx: &Ctx, thread_id: &str, session_id: &str, kp: &axel_identity::K
     Ok(())
 }
 
-fn wait_for_reply(ctx: &Ctx, request_id: &str, timeout: Duration) -> Result<Option<&'static str>> {
+/// The owner's answer to a permission request, as Claude Code's hook output
+/// names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decision {
+    Allow,
+    Deny,
+}
+
+impl Decision {
+    /// A reply's text: `allow` allows; anything else denies, so a garbled
+    /// answer never lets a tool through.
+    fn from_reply(content: &str) -> Decision {
+        if content.trim() == "allow" { Decision::Allow } else { Decision::Deny }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+        }
+    }
+}
+
+/// How often a waiting permission hook looks for the owner's reply.
+const REPLY_POLL_MS: u64 = 500;
+
+/// Wait up to `timeout` (bounded by `launch::HOOK_WAIT_SECS_MAX`) for the
+/// owner's reply to `request_id`.
+fn wait_for_reply(ctx: &Ctx, request_id: &str, timeout: Duration) -> Result<Option<Decision>> {
+    debug_assert!(timeout <= Duration::from_secs(launch::HOOK_WAIT_SECS_MAX), "the wait is capped where it is read");
     let start = Instant::now();
     while start.elapsed() < timeout {
         for m in ctx.store.replies_to(request_id)? {
             if m.kind == kind::PERMISSION_REPLY {
-                return Ok(Some(if m.content.trim() == "allow" { "allow" } else { "deny" }));
+                return Ok(Some(Decision::from_reply(&m.content)));
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(REPLY_POLL_MS));
     }
     Ok(None)
 }

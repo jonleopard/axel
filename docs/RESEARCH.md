@@ -123,6 +123,43 @@ no block/session migration between hosts.
 **Env in every Rex terminal:** `REX_SERVER, REX_SESSION, REX_BLOCK, REX_BIN_DIR`;
 `TERM=xterm-rex`. Not implemented in CLI yet: `rex resize`, `rex block new`.
 
+### Rex 0.1.0-preview.22, API revision 19 (2026-11-22)
+
+Studied from the server's own `GET /llms.txt` and `GET /api/help`, `block_creator.list`,
+CLI help and strings in the binaries. What changed since revision 7, and what matters to us.
+The plan built on it is [RFD 0003](rfd/0003-rex-native-axel.md).
+
+- **Control connection.** `hello` carries `api_revision` and `api_min_revision`; the server
+  picks the newest shared revision and translates messages for older clients. `welcome`
+  adds `reconnect_token` (resume the same client within 60 s), `features`, and `carriers`
+  (other transports, such as QUIC). `session.bootstrap{event_scope, attach_session_ids,
+  data_tickets}` subscribes, lists and attaches in one call. Hello must stay under 512 bytes.
+- **Principals.** Every client has a server-verified `principal`: `peer` (uid), `tailscale`
+  (`user_id`, `login_name`, `node`, `tags`; any tag means a machine) or `anonymous`.
+- **Client actions.** A client declares the actions it performs in `client.keymap{actions}`;
+  others call them with `client.perform`, and the server names the requester. Rex.app
+  offers `client.quick_look` (previews files and links on screen) among others.
+- **Prompts (revision 17).** `rex.ui.input` and `rex.ui.pick` in a config-file action reach
+  every connected app, including iOS, as `client_prompt_requested`; the first answer wins.
+  Default timeout 300 s, at most 3600. Only inside an action's `run`. `rex do` waits for the
+  answer. `client.set_script` actions are announced "from a later version of Rex".
+- **Terminal.** New options `path_prepend`, `login`, `interactive`,
+  `exit.quick_exit_threshold_ms`; `args` is deprecated for `command`. New methods
+  `process`, `ports`, `list_dir`, `input_mode`, `download_begin`/`upload_begin` over
+  `rex.data.bytes.v1`. New events `process_changed`, `ports_changed`, `progress_report`,
+  `url_clicked`, `selection_copied`, `size_changed`, `clipboard_written`.
+- **Layout.** `session.set_layer_state` minimizes and restores floating layers.
+- **New creator.** `com.superlogical.tunnel` with flavors `dial` and `listen`, behind
+  `rex forward`.
+- **Block plugins.** `rex server run --block-dir DIR` starts executable plugins that advertise
+  creators; `--block-plugin-reload` reloads them; `creator_changed` announces changes. The
+  docs list "Block Plugins" with no page yet. There is no plugin registry anywhere.
+- **Servers.** Login-server and shared-server modes for several accounts,
+  `--tailscale-control-url` for Headscale, auth keys and ACL tags for unattended enrollment,
+  and limits (`--max-sessions` 64, `--max-blocks` 1024, `--max-windows` 64, `--max-panes` 64).
+- **Browser.** No web view in Rex.app or the server. The protocol has a `web` client platform
+  and the server takes `--websocket-origin-pattern`, so a browser client looks planned.
+
 ## t3code
 
 **Correction:** execution never moves between machines. "T3 Code keeps execution in the

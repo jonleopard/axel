@@ -1,0 +1,770 @@
+//! The composer pane of a split thread: prompt, queue, pending approval and
+//! mode footer, with the timeline streaming natively in the pane above
+//! ([`crate::stream`]).  Same state machine as the full thread view
+//! ([`ThreadView`] with `compose_only`), so sending, queueing, steering,
+//! history and Shift+Tab modes behave identically.
+
+use std::io::stdout;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use axel_i18n::t;
+use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::execute;
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+
+use crate::Deps;
+use crate::glue;
+use crate::thread::{Row, ThreadAction, ThreadView};
+use crate::util::{cells, now_secs};
+use crate::view::thread_view::{composer_height, queue_height, render_composer, render_queue, row_lines};
+
+const POLL: Duration = Duration::from_millis(60);
+const REFRESH: Duration = Duration::from_millis(300);
+const RETRY_FIT: Duration = Duration::from_millis(400);
+
+/// Run the composer for `thread_id` until Esc (empty composer) or Ctrl+C.
+///
+/// `fit(rows_wanted, rows_now)` is called at start, on resize, and whenever
+/// the pane needs a different height (an approval card appears, the queue
+/// grows), so the host can move the split border; Rex sizes splits by ratio.
+/// `on_question(item_id)` is called once for each question an agent asks
+/// (an `AskUserQuestion` waiting for you), so it can be put in front of you.
+/// `toggle_log(session_id)` shows or minimizes that session's log pane (^L).
+pub fn run_compose(deps: Deps, thread_id: &str, fit: &dyn Fn(u16, u16), on_question: &dyn Fn(&str), toggle_log: &dyn Fn(&str)) -> Result<()> {
+    let owner_pk = glue::owner_pubkey(deps.keystore)?;
+    let data = glue::load_thread(deps.store, &owner_pk, thread_id, now_secs())?;
+    let mut v = ThreadView::new(thread_id, data);
+    v.compose_only = true;
+    let updates = crate::updates::start();
+    let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ask_new = |v: &ThreadView| {
+        for id in new_questions(v, &asked) {
+            on_question(&id);
+            asked.insert(id);
+        }
+    };
+    ask_new(&v);
+
+    let mut terminal = ratatui::init();
+    // Without bracketed paste a paste arrives as keys: worse, but still usable.
+    let _ = execute!(stdout(), EnableBracketedPaste);
+    // Tell Shift+Enter (a line break) apart from Enter (send).
+    let keys = crate::util::enhance_keys();
+    let result = (|| -> Result<()> {
+        let mut last = Instant::now();
+        // Keep the pane as tall as the composer wants (see `PaneFit`).
+        let mut pane = PaneFit::default();
+        let mut watch = StateWatch::new(thread_state(&deps, thread_id));
+        loop {
+            while let Ok(hint) = updates.try_recv() { v.update_hint = hint; }
+            let size = terminal.size()?;
+            v.set_composer_width(size.width);
+            let want = desired_height(&v, size.width);
+            if let Some(ask) = pane.next(want, size.height, Instant::now()) {
+                fit(ask, size.height);
+            }
+            terminal.draw(|f| render(f, &v))?;
+            if event::poll(POLL)? {
+                let ev = event::read()?;
+                crate::util::log_key(&ev);
+                match ev {
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        let action = v.handle_compose_key(key);
+                        match carry_out(&deps, thread_id, &mut v, action, toggle_log) {
+                            Next::Wait => {}
+                            // What was sent shows sooner.
+                            Next::Refresh => last = Instant::now() - REFRESH,
+                            Next::Quit => return Ok(()),
+                        }
+                    }
+                    Event::Paste(text) => v.handle_paste(&text),
+                    _ => {}
+                }
+            }
+            if last.elapsed() >= REFRESH {
+                match glue::load_thread(deps.store, &owner_pk, thread_id, now_secs()) {
+                    Ok(d) => {
+                        v.set_data(d);
+                        ask_new(&v);
+                    }
+                    // As the thread screen does: the next refresh tries again.
+                    Err(e) => v.set_error(t!("error: refresh failed: {error}", error = e)),
+                }
+                // Settled (or archived, deleted) elsewhere, e.g. from the
+                // dashboard: the thread's window goes, as when you leave it.
+                if watch.closed(thread_state(&deps, thread_id)) {
+                    return Ok(());
+                }
+                last = Instant::now();
+            }
+        }
+    })();
+    crate::util::restore_keys(keys);
+    // Teardown: keep restoring the terminal even if this step fails.
+    let _ = execute!(stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    result
+}
+
+/// What the composer's loop does after an action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    Wait,
+    /// Something was sent: read the thread again now.
+    Refresh,
+    Quit,
+}
+
+/// Carry out what a key asked for.
+fn carry_out(deps: &Deps, thread_id: &str, v: &mut ThreadView, action: ThreadAction, toggle_log: &dyn Fn(&str)) -> Next {
+    match action {
+        ThreadAction::None => {}
+        ThreadAction::OpenLog(session_id) => toggle_log(&session_id),
+        ThreadAction::Quit | ThreadAction::Back => return Next::Quit,
+        ThreadAction::Send { session_id, cmd } => {
+            let reply = (deps.send)(&session_id, cmd).map_err(|e| format!("{e:#}"));
+            v.on_reply(reply);
+            return Next::Refresh;
+        }
+        ThreadAction::Summon { thread_id, agent, text, attachments } => {
+            let reply = (deps.summon)(&thread_id, &agent, &text, &attachments).map_err(|e| format!("{e:#}"));
+            v.on_reply(reply.map(|_| crate::thread::SendReply::Ok));
+            return Next::Refresh;
+        }
+        ThreadAction::Manage => {
+            if let Some(open) = deps.open_controls {
+                open(thread_id);
+            }
+        }
+        ThreadAction::OpenTerminal => {
+            if let Some(open) = deps.open_terminal
+                && let Err(e) = open(thread_id)
+            {
+                v.on_reply(Err(format!("could not open terminal: {e:#}")));
+            }
+        }
+    }
+    Next::Wait
+}
+
+/// `None` when the thread is gone or can't be read; the next poll reads it again.
+fn thread_state(deps: &Deps, thread_id: &str) -> Option<axel_store::ThreadState> {
+    deps.store.get_thread(thread_id).ok().flatten().map(|t| t.state)
+}
+
+/// Whether the thread was closed while the composer is up: it was open and
+/// is now settled, archived or deleted.  A thread opened when already settled
+/// stays up, so you can still read and reopen it.
+struct StateWatch {
+    was_open: bool,
+}
+
+impl StateWatch {
+    fn new(state: Option<axel_store::ThreadState>) -> Self {
+        Self { was_open: state == Some(axel_store::ThreadState::Open) }
+    }
+
+    fn closed(&mut self, state: Option<axel_store::ThreadState>) -> bool {
+        let Some(state) = state else { return false };
+        let open = state == axel_store::ThreadState::Open;
+        let closed = self.was_open && !open;
+        self.was_open = open;
+        closed
+    }
+}
+
+/// Questions waiting for you that `asked` hasn't seen, oldest first.
+pub fn new_questions(v: &ThreadView, asked: &std::collections::HashSet<String>) -> Vec<String> {
+    v.data
+        .items
+        .iter()
+        .filter(|it| it.kind == crate::model::ItemKind::Question && it.status == Some(crate::model::ItemStatus::Pending) && !asked.contains(&it.id))
+        .map(|it| it.id.clone())
+        .collect()
+}
+
+/// One question, alone: the floating pane the composer opens when an agent
+/// asks you to choose.  ↑↓ and Enter (or a digit) answer it; Esc leaves it
+/// for the composer.  Returns once it is answered, here or anywhere else.
+pub fn run_answer(deps: Deps, thread_id: &str, item_id: &str) -> Result<()> {
+    let owner_pk = glue::owner_pubkey(deps.keystore)?;
+    let load = || glue::load_thread(deps.store, &owner_pk, thread_id, now_secs()).map(|d| only_question(d, item_id));
+    let mut v = ThreadView::new(thread_id, load()?);
+    v.compose_only = true;
+    let mut terminal = ratatui::init();
+    let result = (|| -> Result<()> {
+        let mut last = Instant::now();
+        loop {
+            if v.pending_choice().is_none() {
+                return Ok(());
+            }
+            terminal.draw(|f| render_answer(f, &v))?;
+            if event::poll(POLL)?
+                && let Event::Key(key) = event::read()?
+                && key.kind != KeyEventKind::Release
+            {
+                match answer_key(&mut v, key) {
+                    AnswerKey::Leave => return Ok(()),
+                    AnswerKey::Send(session_id, cmd) => {
+                        let reply = (deps.send)(&session_id, cmd).map_err(|e| format!("{e:#}"));
+                        let failed = matches!(reply, Ok(crate::thread::SendReply::Error { .. }) | Err(_));
+                        v.on_reply(reply);
+                        if !failed {
+                            return Ok(());
+                        }
+                    }
+                    AnswerKey::None => {}
+                }
+            }
+            if last.elapsed() >= REFRESH {
+                if let Ok(d) = load() {
+                    v.set_data(d);
+                }
+                last = Instant::now();
+            }
+        }
+    })();
+    ratatui::restore();
+    result
+}
+
+/// The thread as the answer pane sees it: only `item_id`, so it is the one
+/// pending choice.
+fn only_question(mut d: crate::model::ThreadData, item_id: &str) -> crate::model::ThreadData {
+    d.items.retain(|it| it.id == item_id);
+    d
+}
+
+/// What a key does in the answer pane.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnswerKey {
+    None,
+    /// Esc / Ctrl+C: answer later, from the composer.
+    Leave,
+    /// The answer, for this session.
+    Send(String, crate::thread::SendCommand),
+}
+
+/// Only picking and answering: ↑↓, Enter, digits; Esc leaves.  Typing does
+/// nothing here (in the composer it declines and redirects).
+pub fn answer_key(v: &mut ThreadView, key: crossterm::event::KeyEvent) -> AnswerKey {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    match key.code {
+        KeyCode::Esc => return AnswerKey::Leave,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return AnswerKey::Leave,
+        KeyCode::Up | KeyCode::Down | KeyCode::Enter => {}
+        KeyCode::Char(c) if c.is_ascii_digit() => {}
+        KeyCode::Char(' ') if v.pending_choice().is_some_and(|i|matches!(v.data.items[i].body,crate::model::ItemBody::Choice {multiple:Some(_),..})) => {}
+        _ => return AnswerKey::None,
+    }
+    match v.handle_compose_key(key) {
+        ThreadAction::Send { session_id, cmd } => AnswerKey::Send(session_id, cmd),
+        _ => AnswerKey::None,
+    }
+}
+
+/// The question card, its options and the keys, from the top of the pane.
+fn render_answer(frame: &mut Frame, v: &ThreadView) {
+    let area = frame.area();
+    let Some(i) = v.pending_choice() else { return };
+    let inner = Rect { x: area.x + 1, y: area.y + 1, width: area.width.saturating_sub(2), height: area.height.saturating_sub(2) };
+    let mut lines = row_lines(v, &Row::Choice(i), inner.width as usize, true);
+    // Replace the generic card hint with the popup's own controls.
+    lines.pop();
+    lines.push(Line::from(""));
+    let hint=if let crate::model::ItemBody::Choice {multiple:Some((min,max)),..}=v.data.items[i].body {
+        t!("↑↓ move · Space toggle · Enter confirm · {min}–{max} picks · Esc later", min = min, max = max)
+    } else {
+        t!("↑↓ pick · Enter or 1–9 answer · Esc answer later in the composer").into()
+    };
+    lines.push(Line::styled(hint, crate::theme::dim()));
+    if let Some(st) = &v.status {
+        lines.push(Line::styled(st.clone(), crate::theme::dim()));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Asking Rex for the composer pane's rows: at once when the composer's height
+/// changes (the host works out the exact split from the panes' geometry),
+/// then, should it still come out short or tall, correcting it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PaneFit {
+    /// Rows the composer wants now.
+    want: Option<u16>,
+    /// Rows last asked.
+    asked: u16,
+    tries: u8,
+    at: Option<Instant>,
+}
+
+impl PaneFit {
+    /// The rows to ask for, if any, given the rows the composer wants and
+    /// the pane's height now.
+    pub fn next(&mut self, want: u16, height: u16, now: Instant) -> Option<u16> {
+        if self.want != Some(want) {
+            self.want = Some(want);
+            self.tries = 0;
+            self.asked = want;
+            self.at = Some(now);
+            return Some(self.asked);
+        }
+        // Give the last ask time to land before reading anything into the size.
+        if self.at.is_some_and(|t| now.duration_since(t) < RETRY_FIT) {
+            return None;
+        }
+        // One spare row is fine: Rex rounds, and chasing it would flip-flop.
+        if height == want || height == want + 1 || self.tries >= 4 {
+            return None;
+        }
+        // Ask for the same rows again: the host works the split out afresh
+        // from the panes as they are now. (Adjusting by the miss compounds a
+        // bad reading instead.)
+        self.asked = want;
+        self.tries += 1;
+        self.at = Some(now);
+        Some(self.asked)
+    }
+}
+
+/// Rows the pane wants: composer, queue and (when pending) the approval card.
+pub fn desired_height(v: &ThreadView, width: u16) -> u16 {
+    // `composer_height` picks its text rows from the area height; ask as a tall pane.
+    let composer = composer_height(v, Rect::new(0, 0, width, 40));
+    let card = v.pending_choice().map_or(0, |i| cells(row_lines(v, &Row::Choice(i), width.saturating_sub(1) as usize, true).len()));
+    composer + queue_height(v) + card
+}
+
+/// Bottom-anchored: [approval card] · [queue] · composer.
+pub fn render(frame: &mut Frame, v: &ThreadView) {
+    let area = frame.area();
+    let composer_h = composer_height(v, area).min(area.height);
+    let queue_h = queue_height(v).min(area.height.saturating_sub(composer_h));
+    let card: Vec<Line> = match v.pending_choice() {
+        Some(i) => row_lines(v, &Row::Choice(i), area.width.saturating_sub(1) as usize, true),
+        None => Vec::new(),
+    };
+    let card_h = cells(card.len()).min(area.height.saturating_sub(composer_h + queue_h));
+    let [_, card_area, queue_area, composer_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(card_h),
+        Constraint::Length(queue_h),
+        Constraint::Length(composer_h),
+    ])
+    .areas(area);
+    if card_h > 0 {
+        // Keep the options (the end of the card) when the pane is short.
+        let skip = card.len().saturating_sub(card_h as usize);
+        let shown: Vec<Line> = card.into_iter().skip(skip).collect();
+        frame.render_widget(Paragraph::new(shown), Rect { x: card_area.x + 1, width: card_area.width.saturating_sub(1), ..card_area });
+    }
+    if queue_h > 0 {
+        render_queue(frame, v, queue_area);
+    }
+    render_composer(frame, v, composer_area);
+}
+
+#[cfg(test)]
+mod state_watch_tests {
+    use super::StateWatch;
+    use axel_store::ThreadState::*;
+
+    #[test]
+    fn settling_an_open_thread_closes_it_but_an_already_settled_one_stays() {
+        let mut w = StateWatch::new(Some(Open));
+        assert!(!w.closed(Some(Open)));
+        assert!(!w.closed(None), "a failed read changes nothing");
+        assert!(w.closed(Some(Done)));
+        for s in [Archived, Deleted] {
+            assert!(StateWatch::new(Some(Open)).closed(Some(s)));
+        }
+        let mut settled = StateWatch::new(Some(Done));
+        assert!(!settled.closed(Some(Done)), "opened to read a settled thread");
+        assert!(!settled.closed(Some(Open)));
+        assert!(settled.closed(Some(Done)), "reopened, then settled again");
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+    use crate::model::{ChoiceOption, ItemBody, ItemKind, ItemStatus};
+    use crate::thread::{SendCommand, fixtures};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn question_data() -> crate::model::ThreadData {
+        let mut d = fixtures::data();
+        let mut q = fixtures::item(
+            "q1",
+            ItemKind::Question,
+            ItemBody::Choice {
+                prompt: "Database: Which one?".into(),
+                options: vec![ChoiceOption { id: "answer:0".into(), label: "Postgres".into(), exclusive: false }, ChoiceOption { id: "answer:1".into(), label: "SQLite".into(), exclusive: false }],
+                chosen: None,
+                multiple: None,
+            },
+            9_000,
+        );
+        q.status = Some(ItemStatus::Pending);
+        q.session_id = "S1".into();
+        d.items.push(q);
+        d
+    }
+
+    #[test]
+    fn each_question_is_put_in_front_of_you_once() {
+        let v = ThreadView::new("T1", question_data());
+        let mut asked = std::collections::HashSet::new();
+        assert_eq!(new_questions(&v, &asked), vec!["q1".to_string()], "the fixture's pending permission isn't a question");
+        asked.insert("q1".to_string());
+        assert!(new_questions(&v, &asked).is_empty());
+    }
+
+    #[test]
+    fn multi_choice_popup_toggles_confirms_and_preserves_checks_on_failure() {
+        let mut data=only_question(question_data(),"q1");
+        if let ItemBody::Choice {multiple,options,..}=&mut data.items[0].body {
+            *multiple=Some((1,2));
+            options.push(ChoiceOption {id:"answer:none".into(),label:"Decline".into(),exclusive:true});
+        }
+        let mut v=ThreadView::new("T1",data.clone()); v.compose_only=true;
+        let key=|code|KeyEvent::new(code,KeyModifiers::NONE);
+        assert_eq!(answer_key(&mut v,key(KeyCode::Enter)),AnswerKey::None,"minimum selection is enforced");
+        assert_eq!(answer_key(&mut v,key(KeyCode::Char(' '))),AnswerKey::None);
+        assert_eq!(answer_key(&mut v,key(KeyCode::Char('2'))),AnswerKey::None,"digits toggle; they do not submit");
+        assert_eq!(v.choice_checked["q1"].len(),2);
+        let mut terminal=ratatui::Terminal::new(ratatui::backend::TestBackend::new(80,12)).unwrap();
+        terminal.draw(|f|render_answer(f,&v)).unwrap();
+        let buffer=terminal.backend().buffer();
+        let text=(0..12).map(|y|(0..80).map(|x|buffer[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("[x] Postgres") && text.contains("[x] SQLite") && text.contains("[ ] Decline"),"{text}");
+        assert!(text.contains("toggle") && text.contains("confirm"),"{text}");
+        v.set_data(data.clone());
+        let expected=AnswerKey::Send("S1".into(),SendCommand::Answer {item_id:"q1".into(),option_id:r#"answer:multi:["answer:0","answer:1"]"#.into()});
+        assert_eq!(answer_key(&mut v,key(KeyCode::Enter)),expected);
+        v.on_reply(Err("temporarily offline".into()));
+        assert_eq!(v.choice_checked["q1"].len(),2);
+        assert_eq!(answer_key(&mut v,key(KeyCode::Enter)),expected);
+        v.on_reply(Err("temporarily offline".into()));
+        answer_key(&mut v,key(KeyCode::Char('3')));
+        assert_eq!(v.choice_checked["q1"],std::collections::HashSet::from(["answer:none".into()]));
+        assert_eq!(answer_key(&mut v,key(KeyCode::Enter)),AnswerKey::Send("S1".into(),SendCommand::Answer {item_id:"q1".into(),option_id:"answer:none".into()}));
+        assert!(v.composer.is_empty(),"question shortcuts cannot leak into the draft");
+    }
+
+    #[test]
+    fn the_answer_pane_answers_its_question_and_ignores_typing() {
+        let mut v = ThreadView::new("T1", only_question(question_data(), "q1"));
+        v.compose_only = true;
+        let k = |c| KeyEvent::new(c, KeyModifiers::NONE);
+        assert_eq!(answer_key(&mut v, k(KeyCode::Char('x'))), AnswerKey::None, "typing does nothing here");
+        assert!(v.composer.is_empty());
+        assert_eq!(answer_key(&mut v, k(KeyCode::Down)), AnswerKey::None);
+        assert_eq!(
+            answer_key(&mut v, k(KeyCode::Enter)),
+            AnswerKey::Send("S1".into(), SendCommand::Answer { item_id: "q1".into(), option_id: "answer:1".into() })
+        );
+        assert_eq!(answer_key(&mut v, k(KeyCode::Esc)), AnswerKey::Leave);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thread::fixtures;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn update_hint_sits_right_of_the_footer_without_changing_the_draft_or_status() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        v.composer.paste("unfinished message");
+        v.status = Some("keep this status".into());
+        let cursor = v.composer.cursor();
+        let height = desired_height(&v, 80);
+        let pending = v.pending_choice();
+        v.update_hint = Some("1.2.3".into());
+        assert_eq!(desired_height(&v, 80), height, "no row of its own");
+        let mut term = Terminal::new(TestBackend::new(80, height)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let rendered = text(&term);
+        assert!(rendered.contains("unfinished message"), "{rendered}");
+        assert!(rendered.contains("keep this status") && !rendered.contains("axel update"), "a status comes first: {rendered}");
+        assert_eq!(v.status.as_deref(), Some("keep this status"));
+        assert_eq!(v.composer.cursor(), cursor);
+        assert_eq!(v.pending_choice(), pending);
+        // Without one, the pill takes the right of the footer row.
+        v.status = None;
+        term.draw(|f| render(f, &v)).unwrap();
+        let footer = text(&term).lines().last().unwrap_or_default().to_string();
+        assert!(footer.trim_end().ends_with("run  axel update  to get 1.2.3"), "{footer:?}");
+        assert!(footer.find("axel update").is_some_and(|i| i > 40), "on the right: {footer:?}");
+    }
+
+    #[test]
+    fn panel_shortcuts_keep_the_draft_and_do_not_answer_pending_questions() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        for draft in ["", "unfinished message"] {
+            v.composer = crate::input::TextInput::with_text(draft);
+            let pending = v.pending_choice();
+            assert_eq!(v.handle_compose_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)), ThreadAction::Manage);
+            assert_eq!(v.handle_compose_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)), ThreadAction::OpenTerminal);
+            assert_eq!(v.composer.text(), draft);
+            assert_eq!(v.pending_choice(), pending);
+        }
+    }
+
+    #[test]
+    fn tab_explains_when_a_split_composer_has_nothing_to_browse() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        v.handle_compose_key(key(KeyCode::Tab));
+        assert_eq!(v.focus, crate::thread::Focus::Composer);
+        assert!(v.status.as_deref().is_some_and(|s| s.contains("nothing to browse")));
+        v.handle_compose_key(key(KeyCode::Char(' ')));
+        assert_eq!(v.composer.text(), " ", "space edits the draft; no timeline cursor lives here");
+        v.attachments.push(std::path::PathBuf::from("test.txt"));
+        v.handle_compose_key(key(KeyCode::Tab));
+        assert_eq!(v.focus, crate::thread::Focus::Attachments);
+    }
+
+    #[test]
+    fn pending_approval_cards_use_the_terminals_background() {
+        let v = ThreadView::new("T1", fixtures::data());
+        let lines = row_lines(&v, &Row::Choice(v.pending_choice().unwrap()), 80, true);
+        assert!(!lines.is_empty());
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            assert!(span.style.bg.is_none_or(|c| c == ratatui::style::Color::Reset));
+        }
+    }
+
+    #[test]
+    fn a_long_question_and_its_options_wrap_instead_of_being_cut() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        let i = v.pending_choice().unwrap();
+        let prompt = format!("{} the very end of the question", "a long question ".repeat(8));
+        let option = format!("{} the very end of the option", "a long option ".repeat(8));
+        if let crate::model::ItemBody::Choice { prompt: p, options, .. } = &mut v.data.items[i].body {
+            *p = prompt.clone();
+            options[0].label = option.clone();
+        }
+        let lines = row_lines(&v, &Row::Choice(i), 40, true);
+        let plain: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert!(plain.iter().all(|l| l.chars().count() <= 40), "{plain:#?}");
+        let all = plain.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("the very end of the question") && all.contains("the very end of the option"), "{all}");
+        // Only the marker is accented; the picked option's text keeps the terminal's colour.
+        for span in lines.iter().flat_map(|l| &l.spans).filter(|s| s.content.contains("option")) {
+            assert_ne!(span.style.fg, Some(crate::theme::ACCENT), "{span:?}");
+        }
+    }
+
+    #[test]
+    fn arrows_move_through_a_draft_taller_than_the_composer_and_return_to_the_end() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        v.set_composer_width(12);
+        let draft = format!("{}end", "0123456789".repeat(12));
+        v.handle_paste(&draft);
+        let mut term = Terminal::new(TestBackend::new(12, 10)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let end = term.get_cursor_position().unwrap();
+        assert!(text(&term).contains("end"));
+        for _ in 0..10 {
+            v.handle_compose_key(key(KeyCode::Up));
+            term.draw(|f| render(f, &v)).unwrap();
+        }
+        assert_eq!(v.composer.cursor(), 23);
+        for _ in 0..10 {
+            v.handle_compose_key(key(KeyCode::Down));
+            term.draw(|f| render(f, &v)).unwrap();
+        }
+        assert_eq!(v.composer.text(), draft);
+        assert_eq!(v.composer.cursor(), 123);
+        assert_eq!(term.get_cursor_position().unwrap(), end);
+        assert!(text(&term).contains("end"));
+    }
+
+    #[test]
+    fn redirected_text_preserves_the_draft_without_answering_an_approval() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        v.composer.paste("draft: ");
+        let pending = v.pending_choice();
+        assert!(pending.is_some());
+        v.handle_paste("1 hello 🦀\nsecond line");
+        assert_eq!(v.composer.text(), "draft: 1 hello 🦀\nsecond line");
+        assert_eq!(v.pending_choice(), pending);
+        assert_eq!(v.focus, crate::thread::Focus::Composer);
+    }
+
+    fn text(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_pane_is_asked_at_once_per_change_and_corrected_if_it_misses() {
+        let t0 = Instant::now();
+        let later = |ms| t0 + Duration::from_millis(ms);
+        let mut f = PaneFit::default();
+        // A change: asked at once, for exactly what's wanted.
+        assert_eq!(f.next(6, 5, t0), Some(6));
+        assert_eq!(f.next(6, 5, later(10)), None, "the resize may not have landed yet");
+        // It missed by a row: asked again, worked out afresh.
+        assert_eq!(f.next(6, 5, later(500)), Some(6));
+        assert_eq!(f.next(6, 6, later(1_000)), None, "it fits");
+        // Growing and shrinking ask for exactly what they need.
+        assert_eq!(f.next(7, 6, later(1_010)), Some(7));
+        assert_eq!(f.next(7, 7, later(1_500)), None);
+        assert_eq!(f.next(6, 7, later(1_510)), Some(6), "no extra row carried into a shrink");
+        // A spare row is left alone.
+        assert_eq!(f.next(6, 7, later(3_000)), None);
+        // Way too tall (a bad split): asked again for what's wanted, not
+        // "wanted minus the miss", which would ask for nothing.
+        let mut f = PaneFit::default();
+        assert_eq!(f.next(4, 8, t0), Some(4));
+        assert_eq!(f.next(4, 8, later(500)), Some(4));
+    }
+
+    #[test]
+    fn a_new_line_doesnt_scroll_the_first_away_while_the_pane_grows() {
+        // No approval card waiting: just the composer.
+        let mut d = fixtures::data();
+        for it in &mut d.items {
+            if it.status == Some(crate::model::ItemStatus::Pending) {
+                it.status = Some(crate::model::ItemStatus::Allowed);
+            }
+        }
+        let mut v = ThreadView::new("T1", d);
+        v.compose_only = true;
+        v.composer.paste("1\n2\n3");
+        let h = desired_height(&v, 60);
+        let draw = |v: &ThreadView, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(60, h)).unwrap();
+            term.draw(|f| render(f, v)).unwrap();
+            text(&term)
+        };
+        let before = draw(&v, h);
+        assert!(before.contains("› 1"), "{before}");
+        // A fourth line, before the pane has grown: 1, 2 and 3 stay put.
+        v.composer.insert_newline();
+        v.composer.insert_char('4');
+        assert_eq!(draw(&v, h), before, "nothing moves until the pane grows");
+        // Grown: all four show.
+        let after = draw(&v, h + 1);
+        assert!(after.contains("› 1") && after.lines().any(|l| l.trim() == "4"), "{after}");
+    }
+
+    #[test]
+    fn the_pane_only_grows_for_agent_suggestions_after_tab() {
+        let mut d = fixtures::data();
+        for it in &mut d.items {
+            if it.status == Some(crate::model::ItemStatus::Pending) {
+                it.status = Some(crate::model::ItemStatus::Allowed);
+            }
+        }
+        d.known_agents = vec![("Nova".into(), None), ("Orion".into(), None)];
+        let mut v = ThreadView::new("T1", d);
+        v.compose_only = true;
+        v.composer.paste("ask ");
+        let plain = desired_height(&v, 60);
+        v.handle_compose_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE));
+        assert_eq!(desired_height(&v, 60), plain, "typing @ keeps the pane height stable");
+        assert!(v.mention_options().is_empty());
+        v.handle_compose_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(v.composer.text(), "ask @", "the first Tab opens the list without completing");
+        let h = desired_height(&v, 60);
+        assert_eq!(h, plain + 3, "a row per agent");
+        let mut term = Terminal::new(TestBackend::new(60, h)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let shown = text(&term);
+        let rows: Vec<&str> = shown.lines().collect();
+        assert!(rows[0].contains("› ask @"), "{shown}");
+        assert!(rows[1].contains("›  @Atlas") && rows[2].contains("@Nova") && rows[3].contains("@Orion"), "{shown}");
+        assert!(shown.contains("pick"), "the footer says how to use the list: {shown}");
+        v.handle_compose_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(desired_height(&v, 60), plain, "Esc dismisses the list");
+    }
+
+    #[test]
+    fn the_pane_it_asks_for_shows_every_line_of_the_message() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        let one = desired_height(&v, 90);
+        v.composer.paste("first line\nsecond line\nthird line");
+        let three = desired_height(&v, 90);
+        assert_eq!(three, one + 2, "two more lines, two more rows");
+        // Drawn at exactly that size, all three lines show (it used to keep two).
+        let mut term = Terminal::new(TestBackend::new(90, three)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let t = text(&term);
+        assert!(t.contains("first line") && t.contains("second line") && t.contains("third line"), "{t}");
+        // And the size it asks for doesn't change once it has it: no back and forth.
+        assert_eq!(desired_height(&v, 90), three);
+    }
+
+    #[test]
+    fn a_pane_shorter_than_the_composer_still_shows_the_input() {
+        let mut d = fixtures::data();
+        d.items[7].status = Some(crate::model::ItemStatus::Allowed);
+        let mut v = ThreadView::new("T1", d);
+        v.compose_only = true;
+        for rows in 1..=3u16 {
+            let mut term = Terminal::new(TestBackend::new(90, rows)).unwrap();
+            term.draw(|f| render(f, &v)).unwrap();
+            let t = text(&term);
+            assert!(t.contains("message the thread"), "{rows} rows: {t}");
+        }
+        let mut term = Terminal::new(TestBackend::new(90, 3)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let t = text(&term);
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines[0].starts_with("› ") && lines[1].starts_with('─') && lines[2].contains("autopilot"), "input · rule · footer, no rule above: {t}");
+    }
+
+    #[test]
+    fn approval_is_answered_from_the_composer_pane() {
+        let mut v = ThreadView::new("T1", fixtures::data());
+        v.compose_only = true;
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| render(f, &v)).unwrap();
+        let t = text(&term);
+        assert!(t.contains("Atlas asks permission: Run cargo test") && t.contains("▸ Allow once"), "{t}");
+        assert!(t.contains("1-9") && t.contains("pick"), "{t}");
+        assert!(!t.contains("PgUp") && !t.contains("timeline keys"), "no timeline here: {t}");
+        // ↓ chooses, a digit answers directly.
+        assert_eq!(v.handle_compose_key(key(KeyCode::Down)), ThreadAction::None);
+        assert_eq!(v.choice_index("p1"), 1);
+        match v.handle_compose_key(key(KeyCode::Char('3'))) {
+            ThreadAction::Send { cmd: crate::thread::SendCommand::Answer { option_id, .. }, .. } => assert_eq!(option_id, "reject"),
+            other => panic!("expected answer, got {other:?}"),
+        }
+        v.on_reply(Ok(crate::thread::SendReply::Ok));
+        // Typing still declines and redirects; Tab never lands on a timeline.
+        v.handle_compose_key(key(KeyCode::Tab));
+        assert_eq!(v.focus, crate::thread::Focus::Composer);
+        v.handle_compose_key(key(KeyCode::Char('n')));
+        assert_eq!(v.composer.text(), "n");
+        // Empty composer, no approval: ↑ is history.
+        let mut d = fixtures::data();
+        d.items[7].status = Some(crate::model::ItemStatus::Allowed);
+        let mut v = ThreadView::new("T1", d);
+        v.compose_only = true;
+        v.handle_compose_key(key(KeyCode::Up));
+        assert_eq!(v.composer.text(), "Fix the login bug");
+    }
+}

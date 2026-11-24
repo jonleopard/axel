@@ -1,4 +1,4 @@
-use axel_store::{AgentColor, RuntimeMode};
+use axel_store::{AgentColor, Effort, RuntimeMode};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// Axel: agent orchestration, designed for Rex.
@@ -21,7 +21,7 @@ pub enum Command {
         /// Screen to open on. Defaults to inbox when something needs you, else launcher.
         #[arg(long, value_enum)]
         screen: Option<ScreenArg>,
-        /// Thread to open (with --screen thread).
+        /// Thread to open (with --screen thread), or whose spend to show (with --screen usage).
         #[arg(long)]
         thread: Option<String>,
     },
@@ -120,6 +120,12 @@ pub enum Command {
     /// Prune old turn checkpoints (archived threads after a week; a month for
     /// live ones, keeping each session's latest turns).
     Gc,
+    /// Axel's part of Rex: the `axel.lua` module that lets agents' questions
+    /// reach you in every Rex app, Mac and iPhone.
+    Rex {
+        #[command(subcommand)]
+        command: RexCommand,
+    },
     /// `axel-links://` links (a click on a run of tool calls opens its details).
     Links {
         #[command(subcommand)]
@@ -185,6 +191,13 @@ pub enum AgentCommand {
         harness: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Claude Code config directory, or `default` for its standard login. Local only.
+        #[arg(long, value_name = "DIR|default")]
+        claude_config_dir: Option<String>,
+        /// How hard its model thinks, where the harness has such a setting
+        /// (default: the harness's own).
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        effort: Option<EffortArg>,
         /// Comma-separated skill names, or `*`.
         #[arg(long, default_value = "*")]
         skills: String,
@@ -201,8 +214,9 @@ pub enum AgentCommand {
         #[command(flatten)]
         policy: PolicyArgs,
     },
-    /// Change anything about an agent: its name, harness, model, skills,
-    /// prompt, colour, permissions, budget, runtime mode or default host.
+    /// Change anything about an agent: its name, harness, model, reasoning
+    /// effort, skills, prompt, colour, permissions, budget, runtime mode or
+    /// default host.
     Edit {
         name: String,
         /// Switch it to this harness, and optionally model: `codex`, `claude/fable`.
@@ -211,6 +225,15 @@ pub enum AgentCommand {
         /// Switch its model only (`default` for the harness's own).
         #[arg(long)]
         model: Option<String>,
+        /// Claude Code config directory, or `default` for its standard login. Local only.
+        #[arg(long, value_name = "DIR|default")]
+        claude_config_dir: Option<String>,
+        /// Remove the agent's explicit Claude Code config directory selection.
+        #[arg(long, conflicts_with = "claude_config_dir")]
+        inherit_claude_config: bool,
+        /// Change how hard its model thinks (`default` for the harness's own).
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        effort: Option<EffortArg>,
         /// Rename it. Its key, policy and history stay; sessions already
         /// running keep the old name until they restart.
         #[arg(long = "name", value_name = "NEW_NAME")]
@@ -332,6 +355,10 @@ pub enum ThreadCommand {
     /// One question an agent asked, to answer (the floating pane the composer opens).
     #[command(hide = true)]
     Answer { thread: String, item: String },
+    /// One question an agent asked, put to you by every connected Rex app;
+    /// the answer pane opens instead when Rex can't reach anyone.
+    #[command(hide = true)]
+    Ask { thread: String, item: String },
     /// A run of tool calls in full (the floating pane a click on one opens).
     #[command(hide = true)]
     Tools { thread: String, fold: String },
@@ -388,6 +415,11 @@ pub enum ThreadCommand {
         project: std::path::PathBuf,
         #[arg(long, value_name = "BRANCH", num_args = 0..=1, default_missing_value = "")]
         worktree: Option<String>,
+    },
+    /// Questions agents are waiting for you to answer, oldest first.
+    Questions {
+        #[arg(long)]
+        json: bool,
     },
     /// List threads.
     #[command(alias = "list")]
@@ -482,6 +514,30 @@ impl From<RuntimeModeArg> for RuntimeMode {
     }
 }
 
+/// `--effort`: an [`Effort`] level, or `default` for none (the harness's own).
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum EffortArg {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Default,
+}
+
+impl From<EffortArg> for Option<Effort> {
+    fn from(e: EffortArg) -> Self {
+        match e {
+            EffortArg::Low => Some(Effort::Low),
+            EffortArg::Medium => Some(Effort::Medium),
+            EffortArg::High => Some(Effort::High),
+            EffortArg::Xhigh => Some(Effort::Xhigh),
+            EffortArg::Max => Some(Effort::Max),
+            EffortArg::Default => None,
+        }
+    }
+}
+
 /// `--color`; mirrors [`AgentColor`].
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum AgentColorArg {
@@ -506,6 +562,16 @@ impl From<AgentColorArg> for AgentColor {
             AgentColorArg::Orange => AgentColor::Orange,
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RexCommand {
+    /// Install or update `axel.lua` in Rex's configuration and reload it.
+    Setup {
+        /// Take it out again, with the line it added to `init.lua`.
+        #[arg(long)]
+        remove: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

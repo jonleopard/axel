@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use axel_i18n::t;
 use axel_store::{Session, SessionState, SessionUpdate};
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +22,8 @@ struct Process { identity: Identity, parent: i32, command: Vec<String> }
 struct Suspension { session_id: String, previous: SessionState, processes: Vec<Identity> }
 
 fn processes() -> Result<HashMap<i32, Process>> {
-    let output = Command::new("ps").args(["-axo", "pid=,ppid=,lstart=,command="]).output().context("listing session processes")?;
-    if !output.status.success() { bail!("could not list session processes") }
+    let output = Command::new("ps").args(["-axo", "pid=,ppid=,lstart=,command="]).output().context(t!("listing session processes"))?;
+    if !output.status.success() { bail!("{}", t!("could not list session processes")) }
     let mut out = HashMap::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
@@ -50,21 +51,38 @@ fn continue_all(identities: &[Identity]) -> Result<()> {
     Ok(())
 }
 
+/// The most generations of processes a pause freezes.  Each round freezes
+/// the children of what is already frozen; a session host, its adapter,
+/// harness and tools are a handful deep, so a tree past this is not one.
+const SUSPEND_ROUNDS_MAX: u32 = 64;
+
 fn suspend(roots: Vec<Identity>, mut record: impl FnMut(&[Identity]) -> Result<()>) -> Result<Vec<Identity>> {
+    assert!(!roots.is_empty(), "a pause has at least one process to freeze");
     let mut stopped = Vec::new();
     let result = (|| -> Result<()> {
-        for root in roots { stopped.push(root); record(&stopped)?; if !signal(stopped.last().unwrap(), libc::SIGSTOP)? { bail!("session exited before it could be paused") } }
+        for root in roots {
+            stopped.push(root.clone());
+            record(&stopped)?;
+            if !signal(&root, libc::SIGSTOP)? { bail!("{}", t!("the session exited before it could be paused")) }
+        }
         // Freeze parents before discovering children. Rescan after freezing so
         // a child spawned during the previous snapshot cannot escape the pause.
-        loop {
+        for _ in 0..SUSPEND_ROUNDS_MAX {
             let current = processes()?;
             let known: HashSet<_> = stopped.iter().filter(|p| current.get(&p.pid).is_some_and(|live| live.identity.started == p.started)).map(|p| p.pid).collect();
             let children: Vec<_> = current.into_values().filter(|p| known.contains(&p.parent) && !known.contains(&p.identity.pid)).map(|p| p.identity).collect();
             if children.is_empty() { return Ok(()) }
-            for child in children { stopped.push(child); record(&stopped)?; signal(stopped.last().unwrap(), libc::SIGSTOP)?; }
+            for child in children {
+                stopped.push(child.clone());
+                record(&stopped)?;
+                signal(&child, libc::SIGSTOP)?;
+            }
         }
+        bail!("{}", t!("the session's process tree is more than {max} levels deep", max = SUSPEND_ROUNDS_MAX))
     })();
     if let Err(error) = result {
+        // The pause failed: wake what it froze.  The pause's error is the one
+        // worth reporting; a process that won't wake has exited.
         let _ = continue_all(&stopped);
         return Err(error);
     }
@@ -77,7 +95,7 @@ fn path(session: &Session) -> PathBuf {
 
 pub(super) fn pause(ctx: &Ctx, session: &Session) -> Result<()> {
     if session.state == SessionState::Paused { return Ok(()) }
-    if session.ended_at.is_some() { bail!("this session has ended") }
+    if session.ended_at.is_some() { bail!("{}", t!("this session has ended")) }
     let mut roots: Vec<_> = processes()?.into_values().filter(|p| {
         p.command.first().is_some_and(|s| s.rsplit('/').next() == Some("axel"))
             && p.command.get(1).map(String::as_str) == Some("session")
@@ -89,13 +107,14 @@ pub(super) fn pause(ctx: &Ctx, session: &Session) -> Result<()> {
     {
         let info = rex.process(block)?;
         if let Some(pid) = info.pointer("/child/pid").and_then(|v| v.as_i64())
-            && let Some(process) = processes()?.remove(&(pid as i32))
+            && let Ok(pid) = i32::try_from(pid)
+            && let Some(process) = processes()?.remove(&pid)
         { roots.push(process.identity); }
     }
-    if roots.is_empty() { bail!("this session's process is not running here") }
+    if roots.is_empty() { bail!("{}", t!("this session's process is not running here")) }
     let signer = ctx.agent_signer(&session.agent_pubkey, Some(&session.thread_id)).or_else(|_| ctx.owner())?;
     let file = path(session);
-    std::fs::create_dir_all(file.parent().unwrap())?;
+    std::fs::create_dir_all(file.parent().expect("path() joins onto the run directory"))?;
     let record = |identities: &[Identity]| -> Result<()> {
         let snapshot = Suspension { session_id: session.id.clone(), previous: session.state, processes: identities.to_vec() };
         let pending = file.with_extension("tmp");
@@ -108,6 +127,9 @@ pub(super) fn pause(ctx: &Ctx, session: &Session) -> Result<()> {
     record(&roots)?;
     ctx.store.update_session(&signer, &session.id, &SessionUpdate { state: Some(SessionState::Paused), ..Default::default() })?;
     let result = suspend(roots, record);
+    // On failure, undo as much as we can and report the first error: the
+    // rollback steps are best effort, and the record left behind (if any)
+    // still lets Resume wake the processes.
     match result {
         Ok(stopped) => {
             if let Err(error) = ctx.store.update_session(&signer, &session.id, &SessionUpdate { state: Some(SessionState::Paused), ..Default::default() }) {
@@ -128,13 +150,14 @@ pub(super) fn pause(ctx: &Ctx, session: &Session) -> Result<()> {
 
 pub(super) fn resume(ctx: &Ctx, session: &Session) -> Result<()> {
     if session.state != SessionState::Paused { return Ok(()) }
-    let snapshot: Suspension = serde_json::from_slice(&std::fs::read(path(session)).context("reading the paused session's process record")?)?;
-    if snapshot.session_id != session.id { bail!("paused process record belongs to another session") }
+    let snapshot: Suspension = serde_json::from_slice(&std::fs::read(path(session)).context(t!("reading the paused session's process record"))?)?;
+    if snapshot.session_id != session.id { bail!("{}", t!("the paused process record belongs to another session")) }
     // Restore the store before waking old hosts, which may use an older enum
     // and will then keep reporting their original in-memory lifecycle state.
     let signer = ctx.agent_signer(&session.agent_pubkey, Some(&session.thread_id)).or_else(|_| ctx.owner())?;
     ctx.store.update_session(&signer, &session.id, &SessionUpdate { state: Some(snapshot.previous), ..Default::default() })?;
     if let Err(error) = continue_all(&snapshot.processes) {
+        // Back to paused so Resume can be tried again; the waking error is the one reported.
         let _ = ctx.store.update_session(&signer, &session.id, &SessionUpdate { state: Some(SessionState::Paused), ..Default::default() });
         return Err(error);
     }

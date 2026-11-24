@@ -4,12 +4,13 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axel_i18n::t;
 
 use super::session::log_path;
 
 pub fn run(session: &str, follow: bool) -> Result<()> {
     let path = log_path(session);
-    let mut file = std::fs::File::open(&path).with_context(|| format!("no log at {}", path.display()))?;
+    let mut file = std::fs::File::open(&path).with_context(|| t!("no log at {path}", path = path.display()))?;
     let mut pos = 0u64;
     loop {
         file.seek(SeekFrom::Start(pos))?;

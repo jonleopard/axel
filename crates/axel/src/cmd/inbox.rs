@@ -160,7 +160,7 @@ fn check_chatter(ctx: &Ctx, thread_id: &str) -> Result<()> {
         .store
         .thread_messages(thread_id)?
         .iter()
-        .filter(|e| e.from != owner && (e.created_at as i64) * 1000 >= since_ms)
+        .filter(|e| e.from != owner && secs_to_ms(e.created_at) >= since_ms)
         .count();
     if sent >= MAX_AGENT_MESSAGES {
         bail!(
@@ -335,19 +335,26 @@ pub fn inbox_messages(ctx: &Ctx, limit: usize) -> Result<Vec<axel_mcp::InboxMess
         .collect())
 }
 
+/// An envelope's Unix seconds as Unix milliseconds.  The stamp is the
+/// sender's, so a value past `i64`'s range saturates instead of wrapping into
+/// the past.
+fn secs_to_ms(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX).saturating_mul(1000)
+}
+
 /// A message `from` sent at `created_s` (Unix seconds) reached its recipient
 /// when one of the recipient's sessions on that thread took a prompt or note
 /// from that sender at or after it.  `got` is (sender, Unix ms) per such item.
 fn was_handled(from: &str, created_s: u64, got: &[(String, i64)]) -> bool {
     // Envelopes are stamped in seconds, items in milliseconds.
-    let sent_ms = created_s as i64 * 1000;
+    let sent_ms = secs_to_ms(created_s);
     got.iter().any(|(f, at)| f == from && *at >= sent_ms)
 }
 
 pub fn show(agent: Option<&str>, json: bool) -> Result<()> {
     let ctx = Ctx::open()?;
     let pk = match agent {
-        Some(name) => ctx.store.agent_by_name(name)?.with_context(|| format!("no agent named {name:?}"))?.pubkey,
+        Some(name) => ctx.store.agent_by_name(name)?.with_context(|| axel_i18n::t!("no agent named {name}", name = format!("{name:?}")))?.pubkey,
         None => ctx.owner()?.public().to_string(),
     };
     let msgs = ctx.store.inbox(&pk, 50)?;
@@ -358,12 +365,12 @@ pub fn show(agent: Option<&str>, json: bool) -> Result<()> {
     let agents = ctx.store.list_agents()?;
     let owner_pk = ctx.owner()?.public().to_string();
     let name_of = |pk: &str| {
-        if pk == owner_pk { return "you".to_string(); }
+        if pk == owner_pk { return axel_i18n::t!("you").to_string(); }
         agents.iter().find(|a| a.pubkey == pk).map(|a| a.name.clone()).unwrap_or_else(|| format!("{}…", &pk[..8]))
     };
     for m in msgs {
-        let when = chrono::DateTime::from_timestamp(m.created_at as i64, 0).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()).unwrap_or_default();
-        println!("{when}  {:<12} {:<18} {}", name_of(&m.from), kind::name(m.kind), m.content.lines().next().unwrap_or(""));
+        let when = i64::try_from(m.created_at).ok().and_then(|secs| chrono::DateTime::from_timestamp(secs, 0)).map(|d| d.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()).unwrap_or_default();
+        println!("{when}  {} {:<18} {}", super::text::pad(&name_of(&m.from), 12), kind::name(m.kind), m.content.lines().next().unwrap_or(""));
     }
     Ok(())
 }
@@ -378,6 +385,7 @@ mod tests {
             name: name.into(),
             harness: axel_store::Harness::Claude,
             model: None,
+            effort: None,
             skills: vec![],
             prompt: None,
             color: None,

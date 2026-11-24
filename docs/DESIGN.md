@@ -36,7 +36,7 @@ aren't decisions yet are in `rfd/`.
 |---|---|
 | **Environment** | A machine running Axel: its filesystem, credentials, DB. Identified by a stable `environment_id`, and by the Rex `host_id` when reachable through Rex. |
 | **Project** | A directory on an environment, usually a git root, optionally with an `AXEL.md`. Projects on different environments that share a `repo_key` (canonical remote URL) are the same repository. |
-| **Agent** | A named identity (Ed25519 keypair, owner attestation) plus a *profile*: harness, model, skills, default prompt, colour. Reusable across threads. Has an inbox. |
+| **Agent** | A named identity (Ed25519 keypair, owner attestation) plus a *profile*: harness, model, reasoning effort, skills, default prompt, colour. Reusable across threads. Has an inbox. |
 | **Harness** | The program that runs the agent: `claude`, `codex`, `opencode`, or a custom command. |
 | **Thread** | **The primitive.** An intent (the initial prompt) and everything done in its name: attached to 0..n projects, realized by many agent *sessions* over time, on one or many environments. States: `open → done → archived`. Live state is derived from its sessions. |
 | **Session** | One agent instance working on a thread: agent + environment + (optional) project + harness process. Owns the Rex block, the harness's own session id (for `--resume`), the transcript, status and token usage. States: `starting → running ⇄ blocked ⇄ idle → ended`. |
@@ -195,6 +195,12 @@ $ axel                               # in any Rex terminal
      `AXEL.lock`; a directory skill is linked whole, scripts and all), and links
      `AXEL.md` as `CLAUDE.md` / `AGENTS.md` (relative; when the project has its own,
      `AXEL.md` goes into the appended system prompt instead),
+   - writes the owner's **standing rules** into that appended system prompt, in full:
+     every global skill (`~/.config/axel/skills`) whose frontmatter says `always: true`,
+     such as the coding style and the commit convention. Skills are otherwise loaded
+     only when an agent invokes them; standing rules hold in every session and every
+     harness (Claude in a pane or managed, Codex), whatever the agent's skill list.
+     Only the global directory can hold them: they are the owner's, not a project's,
    - writes harness hook config so events flow back (see *Signals*),
    - starts the session: a managed one is hosted by `axel session host`; a pane one
      runs the harness with `AXEL_THREAD`, `AXEL_SESSION`, `AXEL_AGENT`, `AXEL_DB` in
@@ -423,7 +429,7 @@ See *The thread model* above for `threads`, `thread_projects`, `sessions`, `stat
 
 ```sql
 environments(id PK, label, rex_host_id, is_local, created_at)
-agents(pubkey PK, name UNIQUE, harness, model, skills_json, prompt, color,
+agents(pubkey PK, name UNIQUE, harness, model, effort NULL, skills_json, prompt, color,
        runtime_mode, auth_tag_json, created_at, last_seen_at, archived_at)
 mentions(message_id, pubkey, PRIMARY KEY(message_id, pubkey))
 message_refs(message_id, ref_id)
@@ -491,7 +497,7 @@ replay on `session/load`. One difference on purpose: Claude uses its native Read
 Edit / Bash instead of the adapter's `mcp__acp__*` stand-ins (Axel's `fs/*` handlers read
 and write the disk just like them), which also saves Claude a ToolSearch round trip per
 turn. No Node or npm is needed; `AXEL_ACP_CLAUDE=claude-code-acp` goes back to Zed's.
-`crates/axel-acp/tests/claude_acp.rs` checks it against a fake `claude`.
+`crates/acp/tests/claude_acp.rs` checks it against a fake `claude`.
 
 **So is Codex's** (`axel codex-acp`, `axel-acp/src/codex/`). Zed's `codex-acp` compiles
 OpenAI's engine in (codex-core, pinned to one Codex release), so it lags the `codex` you
@@ -512,7 +518,7 @@ in three ways:
 - it supports `session/set_model`;
 - it passes the identity prompt as Codex developer instructions.
 
-`AXEL_ACP_CODEX=codex-acp` goes back to Zed's. `crates/axel-acp/tests/codex_acp.rs` checks it
+`AXEL_ACP_CODEX=codex-acp` goes back to Zed's. `crates/acp/tests/codex_acp.rs` checks it
 against a fake app-server.
 
 **Custom ACP agents** use the same host as the built-in adapters. When a model
@@ -522,6 +528,29 @@ Grouped provider choices are supported. Standard `usage_update.used` and `size`
 are context gauges. A cumulative USD `cost` is added only as it grows, without
 counting it again from the adapter's usage extension or prompt reply. Other
 currencies stay out of the USD total.
+
+**Reasoning effort** is part of an agent's profile, beside its model: `low`, `medium`,
+`high`, `xhigh` or `max` (`axel agent new|edit --effort`), or none for the harness's own
+default. It lives on the agent's record and travels in each remote job's agent profile,
+updating (or clearing) the host's record for that agent before the session starts. It is
+applied by capability, never by harness name:
+
+- a **pane** gets the harness's own flag ahead of its other arguments
+  (`Harness::pane_effort_args`: Claude Code `--effort`, Codex `-c model_reasoning_effort=`,
+  Pi `--thinking`, Grok `--reasoning-effort`);
+- a managed session under one of **Axel's own adapters** gets it in `_meta.axel.effort` of
+  `session/new` / `session/load`, and the adapter starts the harness at it (Claude Code
+  `--effort`, Codex `model_reasoning_effort` in the thread's config overrides);
+- **any other ACP agent**, a Claude or Codex behind an `AXEL_ACP_CLAUDE` / `AXEL_ACP_CODEX`
+  override included, is set through the effort selector it advertises in `configOptions`
+  (category `thought_level`, else one named for effort, reasoning or thinking, never a
+  summary selector), with `session/set_config_option` and only to a value it offers.
+
+A level that cannot be applied never fails the session. Axel says so: at launch for a pane,
+on the thread and in the log for a managed session, and in `axel agent show` for what is
+knowable in advance. A pane, or a session under Axel's own adapter, then runs at the
+harness's default; an ACP agent Axel could not change keeps the level it already has, which
+the warning names when the agent reports it.
 
 An agent without the live-steering capability queues prompts until its turn
 finishes. Ctrl+S cancels that turn and sends the new prompt. The live-steering
@@ -581,9 +610,19 @@ thread view (TUI, any pane) ──unix socket──▶ axel session host <id> �
 - **Questions**: Claude's `AskUserQuestion` is on. The Claude adapter asks each question
   as a `session/request_permission` whose options are the choices (ids `answer:<n>`, plus
   `answer:none` for "none of these"); the host never lets policy answer those, records a
-  `Question` item, and reports `blocked` + `kind=question`. The composer opens each new
-  question in a floating, centered pane (`axel thread answer THREAD ITEM`): ↑↓ and Enter,
-  or a digit, answers it; Esc leaves it to the composer. The labels picked go back to
+  `Question` item, and reports `blocked` + `kind=question`. The composer puts each new
+  question to you through Rex (`axel thread ask THREAD ITEM`, its own process): every
+  connected Rex app, Mac and iPhone, shows it in the command palette and the first answer
+  wins. A single-choice question also takes typed text, which declines it and redirects
+  the agent as the composer's Enter does. A multi-select answer outside its bounds is
+  asked again with the bounds in the title. When the question is answered elsewhere, Axel
+  stops waiting and Rex closes the prompt everywhere. Rex asks only from a configuration
+  file action, so Axel keeps `axel.lua` in Rex's config directory, required from a fenced
+  block in `init.lua` (`axel rex setup [--remove]`; installed on first use and by `axel
+  setup`). When Rex can't reach anyone (no app, module refused) the question opens in a
+  floating, centered pane instead (`axel thread answer THREAD ITEM`), as it always does
+  with `AXEL_QUESTIONS=pane`: ↑↓ and Enter, or a digit, answers it; Esc leaves it to the
+  composer. The labels picked go back to
   Claude as the tool's `answers`. Multi-select questions show checkboxes: Space or
   digits toggle, Enter confirms the selected set. Decline clears other checks;
   single-choice questions retain immediate Enter/digit answers. MCP array enum

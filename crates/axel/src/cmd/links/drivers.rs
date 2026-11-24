@@ -3,6 +3,7 @@
 //! terminal output reads (cargo's diagnostics and test results, git's diffs,
 //! log and status, grep's matches), with a one-line summary for the header.
 
+use axel_i18n::t;
 use super::{change_bg, Change, Cell, Lang, Link, Linker, colour_lines, emit_linked, grep_view, parse_grep_line, GrepLine, MAX_LINES};
 
 /// The program whose output a command shows.
@@ -147,19 +148,18 @@ pub(super) fn tool_view(tool: Tool, cmd: &str, output: &str, width: usize, links
 
 /// The header's word on how it went, from the output: `3 errors · 1 warning`,
 /// `462 passed`, `12 matches`.
-pub(super) fn summary(tool: Tool, output: &str) -> Option<String> {
+/// What the tool said, and whether it went wrong (errors, failed tests): the
+/// header shows that in red.
+pub(super) fn summary(tool: Tool, output: &str) -> Option<(String, bool)> {
     match tool {
         Tool::Cargo => cargo_summary(output),
         Tool::Grep => {
             let n = output.lines().filter(|l| matches!(parse_grep_line(l), Some(GrepLine::Hit { matched: true, .. }))).count();
-            (n > 0).then(|| plural(n, "match", "matches"))
+            let text = if n == 1 { t!("1 match").to_string() } else { t!("{n} matches", n = n) };
+            (n > 0).then_some((text, false))
         }
         _ => None,
     }
-}
-
-fn plural(n: usize, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 // ================================================================== cargo
@@ -177,8 +177,9 @@ enum Level {
     Warning,
 }
 
-/// The counts in cargo's output: `2 errors · 1 warning`, or the tests run.
-fn cargo_summary(output: &str) -> Option<String> {
+/// The counts in cargo's output: `2 errors · 1 warning`, or the tests run;
+/// and whether anything failed.
+fn cargo_summary(output: &str) -> Option<(String, bool)> {
     let (mut errors, mut warnings, mut passed, mut failed, mut tests) = (0, 0, 0, 0, false);
     for l in output.lines() {
         if (l.starts_with("error:") || l.starts_with("error[")) && !l.starts_with("error: could not compile") && !l.starts_with("error: aborting") {
@@ -193,18 +194,18 @@ fn cargo_summary(output: &str) -> Option<String> {
     }
     let mut parts = Vec::new();
     if errors > 0 {
-        parts.push(plural(errors, "error", "errors"));
+        parts.push(if errors == 1 { t!("1 error").to_string() } else { t!("{n} errors", n = errors) });
     }
     if warnings > 0 {
-        parts.push(plural(warnings, "warning", "warnings"));
+        parts.push(if warnings == 1 { t!("1 warning").to_string() } else { t!("{n} warnings", n = warnings) });
     }
     if failed > 0 {
-        parts.push(format!("{failed} failed"));
+        parts.push(t!("{n} failed", n = failed));
     }
     if tests && passed + failed > 0 {
-        parts.push(format!("{passed} passed"));
+        parts.push(t!("{n} passed", n = passed));
     }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    (!parts.is_empty()).then(|| (parts.join(" · "), errors > 0 || failed > 0))
 }
 
 /// The number right before `word` (`5 passed;` → 5).
@@ -228,7 +229,7 @@ fn cargo_view(output: &str, width: usize, links: &Linker) -> String {
     let mut out = emit_linked(&lines, &spans, width, "", None);
     let more = output.lines().count().saturating_sub(MAX_LINES);
     if more > 0 {
-        out.push_str(&format!("{}\x1b[2m… {more} more lines\x1b[0m\r\n", super::INDENT));
+        out.push_str(&format!("{}\x1b[2m… {}\x1b[0m\r\n", super::INDENT, t!("{n} more lines", n = more)));
     }
     out
 }
@@ -548,9 +549,9 @@ mod tests {
     #[test]
     fn cargo_counts_what_went_wrong() {
         let out = "warning: unused import: `FileAccountsStore`\n  --> crates/cli/src/fanout.rs:3:5\nerror[E0425]: cannot find value `x`\nerror: could not compile `pay` (lib) due to 1 previous error\nwarning: `pay` (lib) generated 1 warning";
-        assert_eq!(cargo_summary(out).as_deref(), Some("1 error · 1 warning"));
+        assert_eq!(cargo_summary(out), Some(("1 error · 1 warning".into(), true)));
         let tests = "test result: ok. 12 passed; 0 failed; 0 ignored\ntest result: FAILED. 3 passed; 1 failed; 0 ignored";
-        assert_eq!(cargo_summary(tests).as_deref(), Some("1 failed · 15 passed"));
+        assert_eq!(cargo_summary(tests), Some(("1 failed · 15 passed".into(), true)));
         assert_eq!(cargo_summary("   Compiling pay v0.1.0\n    Finished `dev` profile"), None);
     }
 

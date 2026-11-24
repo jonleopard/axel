@@ -15,6 +15,8 @@ pub fn run(state: &str, msg: Option<&str>, kind: Option<&str>) -> Result<()> {
         .map(|k| k.parse().map_err(|_| anyhow::anyhow!("unknown kind {k:?}; use permission|question|auth")))
         .transpose()?;
     let app = std::env::var("AXEL_AGENT_NAME").ok();
+    // The tab indicator is cosmetic, and there is no terminal outside one;
+    // the status recorded below is what Axel reads.
     let _ = osc::emit_to_tty(&osc::Report {
         state: osc_state,
         id: None,

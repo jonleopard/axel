@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::Result;
+use axel_i18n::t;
 use axel_identity::Keypair;
 use axel_store::{Store, UsageDelta};
 use serde_json::Value;
@@ -150,13 +151,14 @@ fn find_codex_rollout(codex_thread_id: &str) -> Option<std::path::PathBuf> {
 /// Explicit refresh for diagnosis, without opening a TUI.
 pub fn refresh() -> Result<()> {
     let store = Store::open_default()?;
-    let (claude, codex) = native::roots().ok_or_else(|| anyhow::anyhow!("home directory unavailable"))?;
+    let (claude, codex) = native::roots().ok_or_else(|| anyhow::anyhow!("{}", t!("home directory unavailable")))?;
     let n = native::Scanner::default().scan(&store, &claude, &codex)?;
-    println!("Reconciled {n} sessions from local harness logs. Axel estimates, rolling 24h:");
+    println!("{}", t!("Reconciled {n} sessions from local harness logs. Axel estimates, rolling 24h:", n = n));
     let now = chrono::Utc::now().timestamp();
-    for u in store.usage_by_agent(now)? {
+    for u in store.usage_by_agent(now, None)? {
         let name = store.agent_by_pubkey(&u.key)?.map(|a| a.name).unwrap_or(u.key);
-        println!("{name}: ${:.2} · {} tokens", u.last_day.cost_usd, u.last_day.tokens());
+        let cost = format!("{:.2}", u.last_day.cost_usd);
+        println!("{}", t!("{name}: ${cost} · {tokens} tokens", name = name, cost = cost, tokens = u.last_day.tokens()));
     }
     Ok(())
 }

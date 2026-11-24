@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use axel_i18n::t;
 use axel_config::{WorkspaceConfig, remote};
 
 use crate::cli::SkillsCommand;
@@ -21,7 +22,7 @@ pub fn run(command: SkillsCommand) -> Result<()> {
 fn manifest() -> Result<Option<WorkspaceConfig>> {
     let cwd = std::env::current_dir()?;
     for dir in cwd.ancestors() {
-        if let Some(config) = WorkspaceConfig::load(dir).context("reading AXEL.md")? {
+        if let Some(config) = WorkspaceConfig::load(dir).context(t!("reading AXEL.md"))? {
             return Ok(Some(config));
         }
         if dir.join(".git").exists() {
@@ -52,7 +53,7 @@ fn origin(skill: &Path, project: Option<&Path>) -> String {
         }
     }
     if skill.starts_with(paths::global_skills_dir()) {
-        return format!("global  {}", tilde(skill.parent().unwrap_or(skill)));
+        return t!("global  {dir}", dir = tilde(skill.parent().unwrap_or(skill)));
     }
     match project.and_then(|p| skill.strip_prefix(p).ok()) {
         Some(rel) => format!("./{}", rel.display()),
@@ -64,13 +65,14 @@ fn ls() -> Result<()> {
     let config = manifest()?;
     let all = super::launch::project_skills(config.as_ref())?;
     if all.is_empty() {
-        println!("no skills here. Add sources under `skills:` in AXEL.md (a directory, or a skills.sh link).");
+        println!("{}", t!("no skills here. Add sources under `skills:` in AXEL.md (a directory, or a skills.sh link)."));
         return Ok(());
     }
     let project = config.as_ref().and_then(|c| c.dir()).map(Path::to_path_buf);
-    let width = all.keys().map(String::len).max().unwrap_or(0);
+    // Terminal columns, not chars: a skill may be named in Chinese.
+    let width = all.keys().map(|k| unicode_width::UnicodeWidthStr::width(k.as_str())).max().unwrap_or(0);
     for (name, skill) in &all {
-        println!("{name:<width$}  {}", origin(&skill.path, project.as_deref()));
+        println!("{}  {}", super::text::pad(name, width), origin(&skill.path, project.as_deref()));
         if let Some(d) = &skill.description {
             let d: String = d.chars().take(96).collect();
             println!("{:<width$}  \x1b[2m{d}\x1b[0m", "");
@@ -90,38 +92,38 @@ fn matches(source: &str, g: &axel_config::GitHubSkills) -> bool {
 
 fn update(only: Option<&str>, yes: bool) -> Result<()> {
     let Some(config) = manifest()? else {
-        bail!("no AXEL.md here or above (up to the repository root)");
+        bail!("{}", t!("no AXEL.md here or above (up to the repository root)"));
     };
-    let dir = config.dir().map(Path::to_path_buf).context("AXEL.md has no directory")?;
+    let dir = config.dir().map(Path::to_path_buf).context(t!("AXEL.md has no directory"))?;
     if config.remote_skills().is_empty() {
-        println!("AXEL.md lists no remote skills.");
+        println!("{}", t!("AXEL.md lists no remote skills."));
         return Ok(());
     }
     if let Some(only) = only
         && !config.remote_skills().iter().any(|g| matches(only, g))
     {
-        bail!("AXEL.md has no remote skill source `{only}`");
+        bail!("{}", t!("AXEL.md has no remote skill source `{source}`", source = only));
     }
-    eprintln!("checking {} remote source(s)…", config.remote_skills().len());
+    eprintln!("{}", t!("checking {n} remote source(s)…", n = config.remote_skills().len()));
     let (mut lock, updates, errors) = remote::check_updates(&config, &paths::skills_cache_dir());
     for e in &errors {
         eprintln!("axel: {e}");
     }
     let updates: Vec<_> = updates.into_iter().filter(|u| only.is_none_or(|o| matches(o, &u.source))).collect();
     if updates.is_empty() {
-        println!("every pin is current.");
+        println!("{}", t!("every pin is current."));
         return Ok(());
     }
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     let mut changed = false;
     for u in &updates {
-        let from = u.from.as_deref().map(short).unwrap_or("unpinned");
+        let from = u.from.as_deref().map(short).unwrap_or(t!("unpinned"));
         println!("\n\x1b[1m{}\x1b[0m  {from} → {}", u.source, short(&u.to));
         show_diff(&u.old, &u.new);
         let apply = if yes {
             true
         } else if interactive {
-            dialoguer::Confirm::new().with_prompt(format!("Pin {} to {}?", u.source, short(&u.to))).default(false).interact()?
+            dialoguer::Confirm::new().with_prompt(t!("Pin {source} to {commit}?", source = u.source, commit = short(&u.to))).default(false).interact()?
         } else {
             false
         };
@@ -132,9 +134,9 @@ fn update(only: Option<&str>, yes: bool) -> Result<()> {
     }
     if changed {
         lock.save(&dir)?;
-        println!("\nwrote {}", tilde(&dir.join(remote::AXEL_LOCK)));
+        println!("\n{}", t!("wrote {path}", path = tilde(&dir.join(remote::AXEL_LOCK))));
     } else if !interactive && !yes {
-        println!("\nnothing applied; rerun with --yes to move these pins.");
+        println!("\n{}", t!("nothing applied; rerun with --yes to move these pins."));
     }
     Ok(())
 }
@@ -145,16 +147,17 @@ fn show_diff(old: &[PathBuf], new: &[PathBuf]) {
     for new_dir in new {
         let name = new_dir.file_name().unwrap_or_default();
         let Some(old_dir) = old.iter().find(|o| o.file_name() == Some(name)) else {
-            println!("  new skill: {}", name.to_string_lossy());
+            println!("  {}", t!("new skill: {name}", name = name.to_string_lossy()));
             continue;
         };
         // `git diff --no-index` exits 1 when the trees differ; that's the point.
+        // Its output is the report; a git that can't run only loses the detail.
         let _ = Command::new("git").args(["diff", "--no-index", "--stat", color]).arg(old_dir).arg(new_dir).status();
         let _ = Command::new("git").args(["diff", "--no-index", color]).arg(old_dir).arg(new_dir).status();
     }
     for old_dir in old {
         if !new.iter().any(|n| n.file_name() == old_dir.file_name()) {
-            println!("  removed upstream: {}", old_dir.file_name().unwrap_or_default().to_string_lossy());
+            println!("  {}", t!("removed upstream: {name}", name = old_dir.file_name().unwrap_or_default().to_string_lossy()));
         }
     }
 }
