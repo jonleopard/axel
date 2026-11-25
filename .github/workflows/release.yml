@@ -1,8 +1,8 @@
 name: Release
 
 # Every commit on main that passes CI ships: a GitHub release `v<version>` with
-# macOS binaries, and the formula in scarce/homebrew-taps moved to it, so
-# `brew upgrade` always lands on the newest main.
+# macOS and Linux binaries, and the formula in scarce/homebrew-taps moved to it,
+# so `brew upgrade` always lands on the newest main.
 #
 # The version is the workspace's major.minor plus the commit count on main
 # (0.3.142), so it only ever grows.
@@ -88,8 +88,55 @@ jobs:
           name: axel-macos
           path: axel-*.tar.gz*
 
+  # Native Linux builds on Ubuntu 22.04 so the binaries' glibc requirement stays low.
+  build-linux:
+    name: Build Linux (${{ matrix.target }})
+    needs: [ci, version]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            artifact: axel-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            artifact: axel-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install libdbus (the keyring's Secret Service backend links it)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Stamp the version
+        run: sed -i -E "/^\[workspace\.package\]/,/^\[/ s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+      - name: Build
+        run: cargo build --release -p axel --bin axel
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          target/release/axel --version | grep -q "$VERSION"
+          name=axel-$VERSION-$TARGET.tar.gz
+          tar -C target/release -czf "$name" axel
+          sha256sum "$name" > "$name.sha256"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: axel-*.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: axel-*.tar.gz*
+
   release:
-    needs: [version, build]
+    needs: [version, build, build-linux]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version.outputs.version }}
