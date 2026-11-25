@@ -4,7 +4,7 @@
 #   curl -fsSL https://axel.md/install | sh
 #   curl -fsSL https://axel.md/install | sh -s -- 0.3.80    # a given version
 #
-# Downloads the latest release of https://github.com/scarce/axel for this Mac,
+# Downloads the latest release of https://github.com/scarce/axel for this machine,
 # checks its sha256 (and its GitHub build provenance, when `gh` is logged in),
 # then installs `axel` into ~/.local/bin, or $AXEL_INSTALL_DIR. Nothing else on
 # the system is touched, and nothing needs sudo. Run it again to update: every
@@ -26,23 +26,36 @@ main() {
     bold='' dim='' green='' red='' reset=''
   fi
 
-  for tool in curl tar shasum uname mktemp; do
+  for tool in curl tar uname mktemp; do
     command -v "$tool" >/dev/null 2>&1 || die "needs \`$tool\`"
   done
-  [ "$(uname -s)" = Darwin ] || die "Axel runs on macOS, next to Rex."
-  [ "$(id -u)" != 0 ] || die "run this as yourself, not root: it installs into your home"
+  command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 \
+    || die "needs \`shasum\` or \`sha256sum\`"
 
-  case "$(uname -m)" in
-    arm64) target=aarch64-apple-darwin ;;
-    x86_64)
-      # A shell under Rosetta reports x86_64 on Apple silicon: take the native build.
-      if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
-        target=aarch64-apple-darwin
-      else
-        target=x86_64-apple-darwin
-      fi ;;
-    *) die "unsupported CPU: $(uname -m)" ;;
+  os=$(uname -s)
+  arch=$(uname -m)
+  case "$os" in
+    Darwin)
+      case "$arch" in
+        arm64) target=aarch64-apple-darwin ;;
+        x86_64)
+          # A shell under Rosetta reports x86_64 on Apple silicon: take the native build.
+          if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
+            target=aarch64-apple-darwin
+          else
+            target=x86_64-apple-darwin
+          fi ;;
+        *) die "unsupported CPU: $arch" ;;
+      esac ;;
+    Linux)
+      case "$arch" in
+        x86_64) target=x86_64-unknown-linux-gnu ;;
+        aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+        *) die "unsupported CPU: $arch" ;;
+      esac ;;
+    *) die "unsupported OS: $os (Axel ships binaries for macOS and Linux)" ;;
   esac
+  [ "$(id -u)" != 0 ] || die "run this as yourself, not root: it installs into your home"
 
   # /releases/latest redirects to /releases/tag/v<version>, under the
   # repository's real name: builds are signed under that name, so that is
@@ -75,7 +88,7 @@ main() {
   fetch -o "$tmp/$name.sha256" "$url.sha256" || die "no checksum for $name"
 
   want=$(cut -d' ' -f1 <"$tmp/$name.sha256")
-  got=$(shasum -a 256 "$tmp/$name" | cut -d' ' -f1)
+  got=$(sha256 "$tmp/$name")
   [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch for $name: refusing to install"
   ok "Checksum verified"
 
@@ -90,7 +103,7 @@ main() {
   tar -xzf "$tmp/$name" -C "$tmp" axel
   [ -f "$tmp/axel" ] && [ ! -L "$tmp/axel" ] || die "unexpected contents in $name"
   chmod 755 "$tmp/axel"
-  installed=$("$tmp/axel" --version 2>/dev/null) || die "the downloaded binary does not run on this Mac"
+  installed=$("$tmp/axel" --version 2>/dev/null) || die "the downloaded binary does not run on this machine"
 
   # Stage next to the destination, then rename: atomic, and a running axel keeps
   # its old binary. A symlink there (a source build's) is replaced, not followed.
@@ -125,6 +138,14 @@ main() {
 # HTTPS only (redirects too), TLS 1.2 or newer, retries on flaky networks, and a
 # failure on any HTTP error, which the caller reports in its own words.
 fetch() { curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --location --retry 3 "$@"; }
+
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    sha256sum "$1" | cut -d' ' -f1
+  fi
+}
 
 step() { printf '%s\n' "$*"; }
 ok() { printf '%s✓%s %s\n' "$green" "$reset" "$*"; }
