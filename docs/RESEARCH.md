@@ -121,7 +121,9 @@ no block/session migration between hosts.
 `client.theme.change`, modes. No action posts a toast or badge.
 
 **Env in every Rex terminal:** `REX_SERVER, REX_SESSION, REX_BLOCK, REX_BIN_DIR`;
-`TERM=xterm-rex`. Not implemented in CLI yet: `rex resize`, `rex block new`.
+`TERM=xterm-rex`. From 0.1.0-preview.23, new terminals no longer set `REX_SESSION`:
+a command finds its session from `REX_BLOCK` (`rex whoami --json` answers
+`session_id`), and any `-s` accepts a block id (issue #42). Not implemented in CLI yet: `rex resize`, `rex block new`.
 
 ### Rex 0.1.0-preview.22, API revision 19 (2026-11-22)
 

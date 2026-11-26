@@ -1,8 +1,9 @@
 //! axel-rex: a client for the Rex terminal multiplexer that shells out to the
 //! `rex` CLI (`rex api call -s SESSION METHOD JSON`).  No WebSocket yet.
 //!
-//! Every Rex terminal exports `REX_SERVER`, `REX_SESSION` and `REX_BLOCK`;
-//! [`detect`] reads them.  All request bodies are built by pure functions in
+//! Every Rex terminal exports `REX_SERVER` and `REX_BLOCK`, and Rex before
+//! 0.1.0-preview.23 also `REX_SESSION`; [`detect`] reads them and asks Rex for
+//! the session when it isn't set.  All request bodies are built by pure functions in
 //! [`payload`] so they can be unit-tested without a server, and the command
 //! runner is injectable through [`Runner`].
 //!
@@ -38,21 +39,44 @@ pub struct RexEnv {
     pub block: String,
 }
 
-/// Read [`RexEnv`] from `REX_SESSION` / `REX_BLOCK` (+ `REX_SERVER`).
-/// `None` when either required variable is missing or empty, i.e. when not
-/// running inside a Rex terminal.
+/// Read [`RexEnv`] from the current terminal's environment.  `None` when not
+/// running inside a Rex terminal, i.e. when `REX_BLOCK` is missing or empty.
+///
+/// Rex 0.1.0-preview.23 stopped exporting `REX_SESSION`: a terminal finds its
+/// session from `REX_BLOCK` (#42).  Without `REX_SESSION`, the session comes
+/// from `rex whoami --json`, which answers for the calling block.  It is asked
+/// each time rather than cached, so it stays right when a pane moves to
+/// another session.
 pub fn detect() -> Option<RexEnv> {
-    let non_empty = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+    let var = |key: &str| std::env::var(key).ok();
+    let server = var("REX_SERVER").filter(|v| !v.trim().is_empty());
+    detect_with(&var, &CliRunner::new(server))
+}
+
+/// [`detect`] over an injected environment and `rex` runner, for tests.
+fn detect_with(var: &dyn Fn(&str) -> Option<String>, runner: &dyn Runner) -> Option<RexEnv> {
+    let non_empty = |key: &str| var(key).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let block = non_empty("REX_BLOCK")?;
+    let session = match non_empty("REX_SESSION") {
+        Some(session) => session,
+        // Rex accepts a block id anywhere a session goes since preview.23,
+        // so commands still reach the right session if `whoami` can't answer.
+        None => session_of_block(runner, &block).unwrap_or_else(|| block.clone()),
     };
-    Some(RexEnv {
-        server: non_empty("REX_SERVER"),
-        session: non_empty("REX_SESSION")?,
-        block: non_empty("REX_BLOCK")?,
-    })
+    assert!(!session.is_empty() && !block.is_empty());
+    Some(RexEnv { server: non_empty("REX_SERVER"), session, block })
+}
+
+/// The session holding `block`, from `rex whoami --json`.  `None` when `rex`
+/// fails, answers without a session, or answers for a different block.
+fn session_of_block(runner: &dyn Runner, block: &str) -> Option<String> {
+    let out = runner.run(&["whoami".to_string(), "--json".to_string()]).ok()?;
+    let who: Value = serde_json::from_str(&out).ok()?;
+    if who.get("block_id").and_then(Value::as_str) != Some(block) {
+        return None;
+    }
+    let session = who.get("session_id").and_then(Value::as_str)?;
+    session.starts_with("session:").then(|| session.to_string())
 }
 
 /// Errors from the Rex client.
@@ -808,20 +832,56 @@ mod tests {
     }
 
     #[test]
-    fn env_accessor_and_detect_requirements() {
+    fn env_accessor() {
         let rex = Rex::new(env());
         assert_eq!(rex.env().session, "session:abc");
         assert_eq!(rex.env().block, "block:def");
-        // detect() needs both REX_SESSION and REX_BLOCK; the test process is
-        // not guaranteed to be inside Rex, so only check consistency.
-        let d = detect();
-        let have = std::env::var("REX_SESSION")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-            && std::env::var("REX_BLOCK")
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-        assert_eq!(d.is_some(), have);
+    }
+
+    /// An environment from fixed pairs, as `detect_with` reads it.
+    fn vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs = pairs.to_vec();
+        move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+    }
+
+    const WHOAMI: &str = r#"{"session_id": "session:s1", "window_id": "window:w1", "block_id": "block:b1"}"#;
+
+    #[test]
+    fn detect_uses_rex_session_when_set() {
+        let fake = Fake::new(vec![]);
+        let env = detect_with(&vars(&[("REX_SESSION", "session:s0"), ("REX_BLOCK", "block:b1")]), &fake).unwrap();
+        assert_eq!((env.session.as_str(), env.block.as_str()), ("session:s0", "block:b1"));
+        assert!(fake.calls.borrow().is_empty(), "no need to ask rex");
+    }
+
+    #[test]
+    fn detect_asks_rex_for_the_session_when_only_the_block_is_set() {
+        // What Rex 0.1.0-preview.23 terminals export (#42).
+        let fake = Fake::new(vec![Ok(WHOAMI.into())]);
+        let env = detect_with(&vars(&[("REX_SERVER", "unix:///tmp/rex.sock"), ("REX_BLOCK", "block:b1")]), &fake).unwrap();
+        assert_eq!(env.session, "session:s1");
+        assert_eq!(env.block, "block:b1");
+        assert_eq!(env.server.as_deref(), Some("unix:///tmp/rex.sock"));
+        assert_eq!(fake.calls.borrow().as_slice(), &[vec!["whoami".to_string(), "--json".to_string()]]);
+    }
+
+    #[test]
+    fn detect_falls_back_to_the_block_when_rex_cannot_say() {
+        let failing = Error::Rex { method: "whoami".into(), stderr: "no server".into() };
+        let other_block = r#"{"session_id": "session:s9", "block_id": "block:other"}"#;
+        for reply in [Err(failing), Ok(other_block.to_string()), Ok("{}".to_string()), Ok("not json".to_string())] {
+            let fake = Fake::new(vec![reply]);
+            let env = detect_with(&vars(&[("REX_BLOCK", "block:b1")]), &fake).unwrap();
+            assert_eq!(env.session, "block:b1");
+        }
+    }
+
+    #[test]
+    fn detect_is_none_outside_rex() {
+        let fake = Fake::new(vec![Ok(WHOAMI.into())]);
+        assert!(detect_with(&vars(&[]), &fake).is_none());
+        assert!(detect_with(&vars(&[("REX_SESSION", "session:s0"), ("REX_BLOCK", "  ")]), &fake).is_none());
+        assert!(fake.calls.borrow().is_empty());
     }
 
     #[test]

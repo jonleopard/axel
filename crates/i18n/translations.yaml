@@ -915,8 +915,8 @@
   zh-Hans: "Rex 主机："
 "unavailable ({error})":
   zh-Hans: "不可用（{error}）"
-"not detected (REX_SESSION unset); launcher runs inline":
-  zh-Hans: "未检测到（REX_SESSION 未设置）；启动器将内联运行"
+"not detected (REX_BLOCK unset); launcher runs inline":
+  zh-Hans: "未检测到（REX_BLOCK 未设置）；启动器将内联运行"
 "owner:":
   zh-Hans: "所有者："
 "env:":

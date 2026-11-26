@@ -21,7 +21,7 @@ pub fn run() -> Result<()> {
                 Err(e) => row(t!("rex host:"), &t!("unavailable ({error})", error = e)),
             }
         }
-        None => row("rex:", t!("not detected (REX_SESSION unset); launcher runs inline")),
+        None => row("rex:", t!("not detected (REX_BLOCK unset); launcher runs inline")),
     }
     let ctx = Ctx::open()?;
     let owner = ctx.owner()?;

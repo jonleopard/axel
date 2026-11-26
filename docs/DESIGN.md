@@ -160,7 +160,8 @@ Writes go through typed methods that build, sign and append envelopes, then proj
 $ axel                               # in any Rex terminal
 ```
 
-1. Axel sees `REX_SESSION`/`REX_BLOCK`, and asks Rex for a **floating layer** in the
+1. Axel sees `REX_BLOCK` (and finds its session from `REX_SESSION`, or from
+   `rex whoami` on Rex 0.1.0-preview.23 and later), and asks Rex for a **floating layer** in the
    upper part of the window (`session.new_layer`) split in two, like a thread's
    stream and composer: the **prompt** (`axel ui --screen launch`) on top, focused,
    and the **recent threads** (`axel ui --screen threads`) below. Outside Rex, the

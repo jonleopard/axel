@@ -258,7 +258,7 @@ Authorization in `append`: kind 100 → always (signer becomes owner). Other thr
 
 ```rust
 pub struct RexEnv { pub server: Option<String>, pub session: String, pub block: String }
-pub fn detect() -> Option<RexEnv>;                      // from REX_SESSION/REX_BLOCK
+pub fn detect() -> Option<RexEnv>;                      // REX_BLOCK required; session from REX_SESSION, else `rex whoami --json`
 pub struct Rex { env: RexEnv }
 impl Rex {
     pub fn new(env: RexEnv) -> Rex;
