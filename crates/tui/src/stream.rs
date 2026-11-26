@@ -50,11 +50,11 @@ pub fn run_stream(store: &axel_store::Store, owner_pk: &str, thread_id: &str, re
     let data = glue::load_thread(store, owner_pk, thread_id, now_secs())?;
     let mut view = ThreadView::new(thread_id, data);
     // Inside Rex, each run of tool calls links to its details (see `ToolsLink`).
-    let links = std::env::var("REX_SESSION").ok().filter(|v| !v.is_empty()).map(|session| crate::util::ToolsLink {
+    let links = axel_rex::detect().map(|rex| crate::util::ToolsLink {
         thread: thread_id.to_string(),
         fold: String::new(),
-        session,
-        server: std::env::var("REX_SERVER").ok().filter(|v| !v.is_empty()),
+        session: rex.session,
+        server: rex.server,
     });
     let mut s = Stream { links, ..Default::default() };
     write!(out, "\x1b[?25l")?; // the cursor would blink under the live tail

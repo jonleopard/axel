@@ -1,8 +1,10 @@
 //! axel-rex: a client for the Rex terminal multiplexer that shells out to the
 //! `rex` CLI (`rex api call -s SESSION METHOD JSON`).  No WebSocket yet.
 //!
-//! Every Rex terminal exports `REX_SERVER`, `REX_SESSION` and `REX_BLOCK`;
-//! [`detect`] reads them.  All request bodies are built by pure functions in
+//! Every Rex terminal exports `REX_SERVER` and `REX_BLOCK` (older Rex builds
+//! also exported `REX_SESSION`); [`detect`] reads `REX_BLOCK` and resolves the
+//! block's current session through `rex whoami --json` (falling back to
+//! `REX_SESSION`).  All request bodies are built by pure functions in
 //! [`payload`] so they can be unit-tested without a server, and the command
 //! runner is injectable through [`Runner`].
 //!
@@ -32,27 +34,102 @@ use serde_json::Value;
 pub struct RexEnv {
     /// `REX_SERVER`: the server address, usually a `unix://` socket URL.
     pub server: Option<String>,
-    /// `REX_SESSION`: the session this terminal belongs to (`session:<uuid>`).
+    /// The session this terminal belongs to (`session:<uuid>`), resolved from
+    /// Rex (`rex whoami --json`) or legacy `REX_SESSION`.
     pub session: String,
     /// `REX_BLOCK`: the block this terminal is (`block:<uuid>`).
     pub block: String,
 }
 
-/// Read [`RexEnv`] from `REX_SESSION` / `REX_BLOCK` (+ `REX_SERVER`).
-/// `None` when either required variable is missing or empty, i.e. when not
-/// running inside a Rex terminal.
-pub fn detect() -> Option<RexEnv> {
-    let non_empty = |k: &str| {
-        std::env::var(k)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
+/// How long [`detect`] waits on `rex whoami --json` before giving up and
+/// falling back to `REX_SESSION`.
+const DETECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Poll interval while waiting for a bounded [`CliRunner`] call to exit.
+const DETECT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Cached result of [`detect`] for this process.
+///
+/// Resolved once so repeated calls across CLI/UI setup do not spawn `rex`
+/// each time. Consequently, a long-lived process that outlives a tab move
+/// keeps the session it resolved when it started.
+static DETECTED: std::sync::OnceLock<Option<RexEnv>> = std::sync::OnceLock::new();
+
+/// Decide the current Rex session from `REX_BLOCK`, what Rex answered, and
+/// the legacy `REX_SESSION` variable.
+///
+/// `REX_BLOCK` is what says we are inside Rex. When Rex reports a session for
+/// the block, that answer wins (even over a stale `REX_SESSION` left behind
+/// after a tab move). When Rex cannot answer, fall back to `REX_SESSION` for
+/// older Rex builds.
+fn resolve_session(
+    block: Option<&str>,
+    rex_session: Option<&str>,
+    env_session: Option<&str>,
+) -> Option<String> {
+    block.map(str::trim).filter(|s| !s.is_empty())?;
+    rex_session
+        .into_iter()
+        .chain(env_session)
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Ask Rex which session holds the current `REX_BLOCK` via `rex whoami --json`.
+/// Any spawn/timeout/exit/JSON error or missing/null `session_id` becomes `None`.
+fn query_whoami_session(runner: &dyn Runner) -> Option<String> {
+    let args = vec![
+        "--autostart=false".to_string(),
+        "--timeout".to_string(),
+        format!("{}s", DETECT_TIMEOUT.as_secs()),
+        "whoami".to_string(),
+        "--json".to_string(),
+    ];
+    let stdout = runner.run(&args).ok()?;
+    let value: Value = serde_json::from_str(&stdout).ok()?;
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn detect_with(
+    server: Option<String>,
+    block: Option<String>,
+    env_session: Option<String>,
+    runner: &dyn Runner,
+) -> Option<RexEnv> {
+    let block = block.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+    let rex_session = query_whoami_session(runner);
+    let session = resolve_session(Some(&block), rex_session.as_deref(), env_session.as_deref())?;
+    let server = server.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     Some(RexEnv {
-        server: non_empty("REX_SERVER"),
-        session: non_empty("REX_SESSION")?,
-        block: non_empty("REX_BLOCK")?,
+        server,
+        session,
+        block,
     })
+}
+
+/// Detect [`RexEnv`] for the current Rex terminal, cached once per process.
+///
+/// `REX_BLOCK` indicates we are inside Rex. The session comes from Rex itself
+/// (`rex whoami --json`), falling back to `REX_SESSION` only when Rex cannot
+/// answer (older Rex builds). Returns `None` when `REX_BLOCK` is missing/empty
+/// or neither source gives a session.
+///
+/// Because the result is cached per process, a process that outlives a tab
+/// move keeps the session it resolved at startup.
+pub fn detect() -> Option<RexEnv> {
+    DETECTED
+        .get_or_init(|| {
+            let var = |k: &str| std::env::var(k).ok();
+            let server = var("REX_SERVER").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let runner = CliRunner::with_timeout(server.clone(), DETECT_TIMEOUT);
+            detect_with(server, var("REX_BLOCK"), var("REX_SESSION"), &runner)
+        })
+        .clone()
 }
 
 /// Errors from the Rex client.
@@ -100,6 +177,7 @@ pub trait Runner {
 pub struct CliRunner {
     program: String,
     server: Option<String>,
+    timeout: Option<std::time::Duration>,
 }
 
 /// `name` is an executable on `PATH`.
@@ -118,23 +196,64 @@ fn installed_rex() -> Option<String> {
     candidates.iter().find(|p| p.is_file()).map(|p| p.to_string_lossy().into_owned())
 }
 
-/// The `rex` executable Axel runs: `$AXEL_REX_BIN`, else `rex` on `PATH`, else
-/// the one the Rex app installs (Rex terminals put it on `PATH`; others don't).
-pub fn program() -> String {
-    std::env::var("AXEL_REX_BIN")
-        .ok()
+/// `$REX_BIN_DIR/rex`, when `REX_BIN_DIR` is set and that file exists.
+fn bin_dir_rex() -> Option<String> {
+    let dir = std::env::var_os("REX_BIN_DIR").filter(|s| !s.is_empty())?;
+    let path = std::path::Path::new(&dir).join("rex");
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
+/// Choose the `rex` executable from the available candidates:
+/// `$AXEL_REX_BIN`, else `$REX_BIN_DIR/rex`, else `rex` on `PATH`, else the
+/// installed app binary, else `"rex"`.
+fn select_program(
+    override_bin: Option<&str>,
+    bin_dir_rex: Option<&str>,
+    rex_on_path: bool,
+    installed: Option<&str>,
+) -> String {
+    if let Some(bin) = override_bin.filter(|s| !s.is_empty()) {
+        return bin.to_string();
+    }
+    if let Some(bin) = bin_dir_rex.filter(|s| !s.is_empty()) {
+        return bin.to_string();
+    }
+    if rex_on_path {
+        return "rex".to_string();
+    }
+    installed
         .filter(|s| !s.is_empty())
-        .or_else(|| (!on_path("rex")).then(installed_rex).flatten())
-        .unwrap_or_else(|| "rex".to_string())
+        .unwrap_or("rex")
+        .to_string()
+}
+
+/// The `rex` executable Axel runs: `$AXEL_REX_BIN`, else `$REX_BIN_DIR/rex`
+/// when that file exists, else `rex` on `PATH`, else the one the Rex app
+/// installs (falling back to `"rex"`).
+pub fn program() -> String {
+    let override_bin = std::env::var("AXEL_REX_BIN").ok();
+    let bin_dir = bin_dir_rex();
+    let rex_on_path = on_path("rex");
+    let installed = installed_rex();
+    select_program(
+        override_bin.as_deref(),
+        bin_dir.as_deref(),
+        rex_on_path,
+        installed.as_deref(),
+    )
 }
 
 impl CliRunner {
-    /// Use `rex` from `PATH` (or `$AXEL_REX_BIN`), talking to `server` if given
-    /// (exported to the child as `REX_SERVER`; the CLI reads it from there).
-    /// Outside a Rex terminal `rex` is usually not on `PATH` (Rex terminals add
-    /// it): then the one the Rex app installs.
+    /// Use `$AXEL_REX_BIN`, else `$REX_BIN_DIR/rex` when that file exists,
+    /// else `rex` from `PATH`, else the one the Rex app installs, talking to
+    /// `server` if given (exported to the child as `REX_SERVER`; the CLI reads
+    /// it from there).
     pub fn new(server: Option<String>) -> CliRunner {
-        CliRunner { program: program(), server }
+        CliRunner { program: program(), server, timeout: None }
+    }
+
+    fn with_timeout(server: Option<String>, timeout: std::time::Duration) -> CliRunner {
+        CliRunner { program: program(), server, timeout: Some(timeout) }
     }
 
     /// The method name an `api call` argv targets, for error messages.
@@ -184,7 +303,12 @@ impl Runner for CliRunner {
         }
         let spawn_error = |source| Error::Spawn { program: self.program.clone(), source };
         let mut child = cmd.spawn().map_err(spawn_error)?;
-        let out = read_output(&mut child).map_err(spawn_error)?;
+        let out = match self.timeout {
+            Some(limit) => wait_or_stop(&mut child, limit, DETECT_POLL, &|| false)
+                .map_err(spawn_error)?
+                .ok_or(Error::Timeout)?,
+            None => read_output(&mut child).map_err(spawn_error)?,
+        };
         if out.is_stdout_cut {
             return Err(Error::Rex {
                 method: CliRunner::method_of(args),
@@ -669,7 +793,14 @@ impl Rex {
         }
         let spawn_error = |source| Error::Spawn { program: program(), source };
         let mut child = cmd.spawn().map_err(spawn_error)?;
-        let Some(out) = wait_or_stop(&mut child, std::time::Duration::from_secs(u64::from(wait_seconds)), should_stop).map_err(spawn_error)? else {
+        let Some(out) = wait_or_stop(
+            &mut child,
+            std::time::Duration::from_secs(u64::from(wait_seconds)),
+            std::time::Duration::from_millis(ASK_POLL_MS),
+            should_stop,
+        )
+        .map_err(spawn_error)?
+        else {
             return Ok(prompt::Answer::Unanswered(prompt::Unanswered::Withdrawn));
         };
         let method = "client.action".to_string();
@@ -693,21 +824,33 @@ const ASK_SLACK_SECONDS: u32 = 30;
 /// How often [`Rex::ask`] checks whether to stop waiting. A fifth of a second
 /// is quicker than a person notices and costs one closure call.
 const ASK_POLL_MS: u64 = 200;
+/// How long [`wait_or_stop`] waits for a child's stdout and stderr pipes to
+/// reach EOF after the child exits before giving up (for example if a
+/// descendant kept them open).
+const PIPE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Wait for `child` until it exits, `limit` passes, or `should_stop` says so.
 /// `None` when stopped or past the limit: the child is killed, which makes
-/// Rex close its prompt. Output is drained on threads so it can't block.
-fn wait_or_stop(child: &mut std::process::Child, limit: std::time::Duration, should_stop: &dyn Fn() -> bool) -> std::io::Result<Option<Output>> {
+/// Rex close its prompt. Output is drained on threads so it can't block, and
+/// pipe collection after exit is bounded by [`PIPE_DRAIN_GRACE`].
+fn wait_or_stop(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    poll: std::time::Duration,
+    should_stop: &dyn Fn() -> bool,
+) -> std::io::Result<Option<Output>> {
     use std::io::Read;
     let drain = |pipe: Option<Box<dyn Read + Send>>, max: u64| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(pipe) = pipe {
                 // A read error leaves what was read; the exit status still decides.
                 let _ = pipe.take(max).read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = tx.send(bytes);
+        });
+        rx
     };
     let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), STDOUT_BYTES_MAX);
     let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>), STDERR_BYTES_MAX);
@@ -722,10 +865,19 @@ fn wait_or_stop(child: &mut std::process::Child, limit: std::time::Duration, sho
             child.wait()?;
             return Ok(None);
         }
-        std::thread::sleep(std::time::Duration::from_millis(ASK_POLL_MS));
+        std::thread::sleep(poll);
     };
-    let join = |handle: std::thread::JoinHandle<Vec<u8>>| handle.join().unwrap_or_default();
-    Ok(Some(Output { status, stdout: join(stdout), stderr: join(stderr), is_stdout_cut: false }))
+    let drain_deadline = std::time::Instant::now() + PIPE_DRAIN_GRACE;
+    let recv = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(drain_deadline.saturating_duration_since(std::time::Instant::now())).ok()
+    };
+    let Some(stdout) = recv(stdout) else {
+        return Ok(None);
+    };
+    let Some(stderr) = recv(stderr) else {
+        return Ok(None);
+    };
+    Ok(Some(Output { status, stdout, stderr, is_stdout_cut: false }))
 }
 
 fn str_field(v: &Value, method: &str, field: &'static str) -> Result<String, Error> {
@@ -808,20 +960,14 @@ mod tests {
     }
 
     #[test]
-    fn env_accessor_and_detect_requirements() {
-        let rex = Rex::new(env());
-        assert_eq!(rex.env().session, "session:abc");
-        assert_eq!(rex.env().block, "block:def");
-        // detect() needs both REX_SESSION and REX_BLOCK; the test process is
-        // not guaranteed to be inside Rex, so only check consistency.
-        let d = detect();
-        let have = std::env::var("REX_SESSION")
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
-            && std::env::var("REX_BLOCK")
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-        assert_eq!(d.is_some(), have);
+    fn env_accessor_returns_given_env() {
+        let given = RexEnv {
+            server: Some("unix:///tmp/rex.sock".into()),
+            session: "session:abc".into(),
+            block: "block:def".into(),
+        };
+        let rex = Rex::new(given.clone());
+        assert_eq!(rex.env(), &given);
     }
 
     #[test]
@@ -1114,7 +1260,7 @@ mod tests {
 
     #[test]
     fn cli_runner_returns_stdout_and_reports_stderr_on_failure() {
-        let runner = CliRunner { program: "/bin/sh".into(), server: None };
+        let runner = CliRunner { program: "/bin/sh".into(), server: None, timeout: None };
         let ok = runner.run(&["-c".into(), "echo out; echo noise >&2".into()]).unwrap();
         assert_eq!(ok, "out\n");
         match runner.run(&["-c".into(), "echo bad >&2; exit 3".into()]) {
@@ -1132,10 +1278,213 @@ mod tests {
         let runner = CliRunner {
             program: "/nonexistent/axel-rex-test-binary".into(),
             server: None,
+            timeout: None,
         };
         match runner.run(&["api".into(), "call".into(), "server.status".into()]) {
             Err(Error::Spawn { program, .. }) => assert!(program.contains("nonexistent")),
             other => panic!("{other:?}"),
         }
+    }
+
+    // Process tests (spawn /bin/sh directly, never `rex`).
+    #[test]
+    fn process_cli_runner_timeout_bounds_slow_command() {
+        let runner = CliRunner {
+            program: "/bin/sh".into(),
+            server: None,
+            timeout: Some(std::time::Duration::from_millis(100)),
+        };
+        let started = std::time::Instant::now();
+        let err = runner.run(&["-c".into(), "sleep 5".into()]).unwrap_err();
+        assert!(matches!(err, Error::Timeout), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn process_cli_runner_timeout_bounds_open_pipe_from_descendant() {
+        let runner = CliRunner {
+            program: "/bin/sh".into(),
+            server: None,
+            timeout: Some(std::time::Duration::from_millis(100)),
+        };
+        let started = std::time::Instant::now();
+        let err = runner
+            .run(&["-c".into(), "sleep 5 & exit 0".into()])
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn select_program_precedence() {
+        // 1. $AXEL_REX_BIN override beats everything.
+        assert_eq!(
+            select_program(
+                Some("/override/rex"),
+                Some("/rex-bin/rex"),
+                true,
+                Some("/app/rex"),
+            ),
+            "/override/rex"
+        );
+        // Empty override falls through to $REX_BIN_DIR/rex.
+        assert_eq!(
+            select_program(Some(""), Some("/rex-bin/rex"), true, Some("/app/rex")),
+            "/rex-bin/rex"
+        );
+        // 2. $REX_BIN_DIR/rex beats PATH and installed app path.
+        assert_eq!(
+            select_program(None, Some("/rex-bin/rex"), true, Some("/app/rex")),
+            "/rex-bin/rex"
+        );
+        assert_eq!(
+            select_program(None, Some("/rex-bin/rex"), false, Some("/app/rex")),
+            "/rex-bin/rex"
+        );
+        // 3. `rex` on PATH beats installed app path.
+        assert_eq!(
+            select_program(None, None, true, Some("/app/rex")),
+            "rex"
+        );
+        // 4. Installed app path when not on PATH.
+        assert_eq!(
+            select_program(None, None, false, Some("/app/rex")),
+            "/app/rex"
+        );
+        // 5. Fallback to bare "rex" when nothing else is found.
+        assert_eq!(select_program(None, None, false, None), "rex");
+    }
+
+    #[test]
+    fn resolve_session_prefers_rex_answer_and_falls_back_to_env() {
+        assert_eq!(
+            resolve_session(Some("block:1"), Some("session:live"), None),
+            Some("session:live".into())
+        );
+        assert_eq!(
+            resolve_session(Some("block:1"), Some("session:live"), Some("session:stale")),
+            Some("session:live".into())
+        );
+        assert_eq!(
+            resolve_session(Some("block:1"), None, Some("session:legacy")),
+            Some("session:legacy".into())
+        );
+        assert_eq!(resolve_session(Some("block:1"), None, None), None);
+        assert_eq!(
+            resolve_session(None, Some("session:live"), Some("session:legacy")),
+            None
+        );
+        assert_eq!(
+            resolve_session(Some("   "), Some("session:live"), Some("session:legacy")),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_with_resolves_session_from_whoami_json() {
+        let fake = Fake::new(vec![Ok(
+            r#"{"session_id":"session:real","block_id":"block:1","window_id":"window:1"}"#.into(),
+        )]);
+        let detected = detect_with(
+            Some("unix:///tmp/rex.sock".into()),
+            Some("block:1".into()),
+            None,
+            &fake,
+        );
+        assert_eq!(
+            detected,
+            Some(RexEnv {
+                server: Some("unix:///tmp/rex.sock".into()),
+                session: "session:real".into(),
+                block: "block:1".into(),
+            })
+        );
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            vec!["--autostart=false", "--timeout", "2s", "whoami", "--json"]
+        );
+
+        // When both Rex and a stale REX_SESSION exist, Rex's answer wins.
+        let fake_override = Fake::new(vec![Ok(
+            r#"{"session_id":"session:moved","block_id":"block:1"}"#.into(),
+        )]);
+        let detected = detect_with(
+            None,
+            Some("block:1".into()),
+            Some("session:stale".into()),
+            &fake_override,
+        );
+        assert_eq!(
+            detected,
+            Some(RexEnv {
+                server: None,
+                session: "session:moved".into(),
+                block: "block:1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn detect_with_handles_null_session_invalid_json_and_runner_error() {
+        // session_id: null -> None without REX_SESSION, falls back with REX_SESSION
+        let fake_null = Fake::new(vec![Ok(r#"{"session_id":null,"block_id":null}"#.into())]);
+        assert_eq!(detect_with(None, Some("block:1".into()), None, &fake_null), None);
+        assert_eq!(fake_null.calls.borrow().len(), 1);
+
+        let fake_null_fallback = Fake::new(vec![Ok(r#"{"session_id":null,"block_id":null}"#.into())]);
+        assert_eq!(
+            detect_with(None, Some("block:1".into()), Some("session:legacy".into()), &fake_null_fallback),
+            Some(RexEnv {
+                server: None,
+                session: "session:legacy".into(),
+                block: "block:1".into(),
+            })
+        );
+        assert_eq!(fake_null_fallback.calls.borrow().len(), 1);
+
+        // Invalid JSON -> None without REX_SESSION, falls back with REX_SESSION
+        let fake_bad_json = Fake::new(vec![Ok("not json".into())]);
+        assert_eq!(detect_with(None, Some("block:1".into()), None, &fake_bad_json), None);
+        assert_eq!(fake_bad_json.calls.borrow().len(), 1);
+
+        let fake_bad_json_fallback = Fake::new(vec![Ok("not json".into())]);
+        assert_eq!(
+            detect_with(None, Some("block:1".into()), Some("session:legacy".into()), &fake_bad_json_fallback),
+            Some(RexEnv {
+                server: None,
+                session: "session:legacy".into(),
+                block: "block:1".into(),
+            })
+        );
+        assert_eq!(fake_bad_json_fallback.calls.borrow().len(), 1);
+
+        // Runner error -> None without REX_SESSION, falls back with REX_SESSION
+        let fake_err = Fake::new(vec![Err(Error::Timeout)]);
+        assert_eq!(detect_with(None, Some("block:1".into()), None, &fake_err), None);
+        assert_eq!(fake_err.calls.borrow().len(), 1);
+
+        let fake_err_fallback = Fake::new(vec![Err(Error::Rex {
+            method: "whoami".into(),
+            stderr: "unknown command".into(),
+        })]);
+        assert_eq!(
+            detect_with(None, Some("block:1".into()), Some("session:legacy".into()), &fake_err_fallback),
+            Some(RexEnv {
+                server: None,
+                session: "session:legacy".into(),
+                block: "block:1".into(),
+            })
+        );
+        assert_eq!(fake_err_fallback.calls.borrow().len(), 1);
+
+        // No block -> never invokes runner
+        let fake_unused = Fake::new(vec![]);
+        assert_eq!(
+            detect_with(None, None, Some("session:legacy".into()), &fake_unused),
+            None
+        );
+        assert!(fake_unused.calls.borrow().is_empty());
     }
 }

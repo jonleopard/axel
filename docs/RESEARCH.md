@@ -120,7 +120,7 @@ no block/session migration between hosts.
 `client.tab.goto`, `pane.split|float|zoom|close|resize`, `client.sidebar.activity.toggle`,
 `client.theme.change`, modes. No action posts a toast or badge.
 
-**Env in every Rex terminal:** `REX_SERVER, REX_SESSION, REX_BLOCK, REX_BIN_DIR`;
+**Env in every Rex terminal:** `REX_SERVER, REX_BLOCK, REX_BIN_DIR` (Rex 0.1.0-preview.23 dropped `REX_SESSION` because tabs can move between sessions; `rex whoami --json` resolves it);
 `TERM=xterm-rex`. Not implemented in CLI yet: `rex resize`, `rex block new`.
 
 ### Rex 0.1.0-preview.22, API revision 19 (2026-11-22)
