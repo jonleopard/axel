@@ -7,21 +7,37 @@ use axel_store::{Refusal, Reach, SummonCheck, local_day_start};
 
 use super::Ctx;
 
+/// Who a policy check treats as the caller, when it isn't this process's own.
+#[derive(Clone, Debug)]
+enum Acting {
+    /// The owner, whatever `$AXEL_AGENT` says: a scheduled run the owner set up.
+    Owner,
+    /// An agent, in a session or not.
+    Agent { agent: String, session: Option<String> },
+}
+
 thread_local! {
-    /// Who is asking, when this process acts for an agent that isn't its
-    /// own caller: syncing delivers a remote agent's message here, and the
-    /// summons it causes must be checked as that agent's session.
-    static ACTING_AS: std::cell::RefCell<Option<(String, Option<String>)>> = const { std::cell::RefCell::new(None) };
+    /// Who is asking, when this process acts for someone who isn't its own
+    /// caller: syncing delivers a remote agent's message here, and the
+    /// summons it causes must be checked as that agent's session; a
+    /// scheduled run is checked as the schedule's author.
+    static ACTING_AS: std::cell::RefCell<Option<Acting>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Until the guard drops, policy checks treat `agent` (in `session`) as the
 /// caller instead of this process's own `$AXEL_AGENT` / `$AXEL_SESSION`.
 pub fn act_as(agent: &str, session: Option<&str>) -> ActingAs {
-    let prev = ACTING_AS.with(|a| a.replace(Some((agent.to_string(), session.map(String::from)))));
-    ActingAs(prev)
+    let acting = Acting::Agent { agent: agent.to_string(), session: session.map(String::from) };
+    ActingAs(ACTING_AS.with(|a| a.replace(Some(acting))))
 }
 
-pub struct ActingAs(Option<(String, Option<String>)>);
+/// Until the guard drops, policy checks treat the owner as the caller, even
+/// in a process an agent started.
+pub fn act_as_owner() -> ActingAs {
+    ActingAs(ACTING_AS.with(|a| a.replace(Some(Acting::Owner))))
+}
+
+pub struct ActingAs(Option<Acting>);
 
 impl Drop for ActingAs {
     fn drop(&mut self) {
@@ -32,18 +48,20 @@ impl Drop for ActingAs {
 
 /// The session an agent's process runs in, if this command was run by one.
 pub fn caller_session() -> Option<String> {
-    if let Some((_, s)) = ACTING_AS.with(|a| a.borrow().clone()) {
-        return s;
+    match ACTING_AS.with(|a| a.borrow().clone()) {
+        Some(Acting::Owner) => None,
+        Some(Acting::Agent { session, .. }) => session,
+        None => std::env::var("AXEL_SESSION").ok().filter(|s| !s.trim().is_empty()),
     }
-    std::env::var("AXEL_SESSION").ok().filter(|s| !s.trim().is_empty())
 }
 
 /// The agent running this command, if any (`$AXEL_AGENT`).
 pub fn caller_agent() -> Option<String> {
-    if let Some((a, _)) = ACTING_AS.with(|a| a.borrow().clone()) {
-        return Some(a);
+    match ACTING_AS.with(|a| a.borrow().clone()) {
+        Some(Acting::Owner) => None,
+        Some(Acting::Agent { agent, .. }) => Some(agent),
+        None => std::env::var("AXEL_AGENT").ok().filter(|s| !s.trim().is_empty()),
     }
-    std::env::var("AXEL_AGENT").ok().filter(|s| !s.trim().is_empty())
 }
 
 /// Display name of a pubkey: the agent's name, else a short prefix.
@@ -130,26 +148,57 @@ pub fn check_message(ctx: &Ctx, recipients: &[String]) -> Result<()> {
     bail!("{}", axel_mcp::SendError::NoReach { from: name_of(ctx, &from), to: denied })
 }
 
-/// The recipients (pubkeys) `from` may not message: not in its reach, and not
-/// agents that may reach it (whom it may always answer).
+/// The recipients (pubkeys) `from` may not message: not in its reach (its
+/// own and its teams'), and not agents that may reach it (whom it may
+/// always answer).
 pub fn denied_reach(ctx: &Ctx, from: &str, recipients: &[String]) -> Result<Vec<String>> {
-    let reach = ctx.store.agent_policy(from)?.reach;
     let mut denied = Vec::new();
-    for r in recipients.iter().filter(|r| **r != from && !reach.allows(r) && !reach_granted(r)) {
-        if !ctx.store.agent_policy(r)?.reach.allows(from) {
+    for r in recipients.iter().filter(|r| **r != from && !reach_granted(r)) {
+        if !ctx.store.may_reach(from, r)? && !ctx.store.may_reach(r, from)? {
             denied.push(r.clone());
         }
     }
     Ok(denied)
 }
 
-/// One-line description of a reach, with names.
+/// One-line description of an agent's own reach, with names.
 pub fn reach_label(ctx: &Ctx, reach: &Reach) -> String {
+    let names = |pks: &[String]| pks.iter().map(|pk| name_of(ctx, pk)).collect::<Vec<_>>().join(", ");
+    let with_names = |rule: String, pks: &[String]| if pks.is_empty() { rule } else { format!("{rule} + {}", names(pks)) };
     match reach {
         Reach::Nobody => axel_i18n::t!("nobody (only you)").into(),
         Reach::Anyone => axel_i18n::t!("any agent").into(),
-        Reach::Only(pks) => pks.iter().map(|pk| name_of(ctx, pk)).collect::<Vec<_>>().join(", "),
+        Reach::Only(pks) => names(pks),
+        Reach::Team(pks) => with_names(axel_i18n::t!("its teams' members").into(), pks),
+        Reach::Lead(pks) => with_names(axel_i18n::t!("as its teams' leads allow").into(), pks),
     }
+}
+
+/// What an agent's teams add to its own reach, one line per team, and how
+/// the parts combine (RFD 0005: say where each part came from).  Empty when
+/// no team takes part.
+pub fn team_reach_lines(ctx: &Ctx, reach: &axel_store::EffectiveReach) -> Vec<String> {
+    let mut lines = Vec::new();
+    for part in &reach.teams {
+        let who: Vec<String> = part.profiles.iter().map(|p| profile_label(ctx, p)).collect();
+        let who = if who.is_empty() { axel_i18n::t!("nobody (only you)").to_string() } else { who.join(", ") };
+        lines.push(axel_i18n::t!("team    {team} ({rule}): {who}", team = part.team_name, rule = part.reach, who = who).to_string());
+    }
+    if reach.from_teams() {
+        // `nobody` and a bare list set no rule of their own (see `EffectiveReach`).
+        let note = match reach.own {
+            Reach::Nobody | Reach::Only(_) => axel_i18n::t!("its own reach sets no rule, so its teams' applies; agents it names come on top"),
+            Reach::Anyone | Reach::Team(_) | Reach::Lead(_) => axel_i18n::t!("the stricter of its own rule and its teams' wins; agents it names come on top"),
+        };
+        lines.push(format!("        {note}"));
+    }
+    lines
+}
+
+/// A profile's name, or a short id when this replica doesn't know it.
+fn profile_label(ctx: &Ctx, profile_id: &str) -> String {
+    // A failed read shows the id: the line still says who it is.
+    ctx.store.profile(profile_id).ok().flatten().map_or_else(|| profile_id.chars().take(10).collect(), |p| p.name)
 }
 
 #[cfg(test)]
@@ -165,5 +214,15 @@ mod grant_tests {
             assert!(!reach_granted("pk-nova"), "only who the owner allowed");
         }
         assert!(!reach_granted("pk-atlas"), "gone with the guard");
+    }
+
+    #[test]
+    fn acting_as_the_owner_hides_the_agent_and_restores_it() {
+        let _agent = act_as("pk-atlas", Some("s1"));
+        {
+            let _owner = act_as_owner();
+            assert_eq!((caller_agent(), caller_session()), (None, None));
+        }
+        assert_eq!((caller_agent(), caller_session()), (Some("pk-atlas".into()), Some("s1".into())));
     }
 }

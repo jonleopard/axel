@@ -17,9 +17,10 @@ aren't decisions yet are in `rfd/`.
 2. **Structured over scraped.** Every signal comes through a protocol: Claude Code
    hooks, Codex notify, ACP frames, OSC 7501 program status. Never `capture-pane`
    and grep. (This is where Axel v1 failed.)
-3. **Agents are principals.** An agent is a named identity with an Ed25519 key,
-   attested by its owner, addressable as `@name`, with an inbox. Identity outlives
-   any process or thread. (Borrowed from Buzz, re-keyed from secp256k1 to Ed25519.)
+3. **Agents are principals.** An agent is a *profile*, the owner's and the same on
+   every machine, with an *instance* per machine: an Ed25519 key attested by that
+   machine, addressable as `@name`, with an inbox. Identity outlives any process or
+   thread. (Borrowed from Buzz, re-keyed from secp256k1 to Ed25519; ADR 0012.)
 4. **Local-first, the signed log is the truth.** One `~/.axel/axel.db` per machine holds
    the event log and its projections. CLI, hooks and the TUI all append to it. Replicas
    merge by union. No daemon in v0; one appears only for always-on sync.
@@ -36,13 +37,19 @@ aren't decisions yet are in `rfd/`.
 |---|---|
 | **Environment** | A machine running Axel: its filesystem, credentials, DB. Identified by a stable `environment_id`, and by the Rex `host_id` when reachable through Rex. |
 | **Project** | A directory on an environment, usually a git root, optionally with an `AXEL.md`. Projects on different environments that share a `repo_key` (canonical remote URL) are the same repository. |
+| **Agent** | A *profile* and its *instances* (ADR 0012). Reusable across threads. `@name` names the profile. |
+| **Agent profile** | What an agent is: name, harness, model, reasoning effort, skills, default prompt, colour, runtime mode. The owner's, the same on every device, no key. Names are unique per owner. |
+| **Agent instance** | A profile on one machine: an Ed25519 keypair attested by that machine's key. It signs, it has the inbox, its sessions hang off its pubkey. `@name@device` names one. |
+| **Device** | A machine whose key an owner linked (kind 120): its key then speaks for that owner. |
+
 | **Agent** | A named identity (Ed25519 keypair, owner attestation) plus a *profile*: harness, model, reasoning effort, skills, default prompt, colour. Reusable across threads. Has an inbox. |
+| **Team** | A named set of the owner's agent profiles, with skill sources and a reach rule they share, and a free-text role per member (RFD 0005). See *Teams*. |
 | **Harness** | The program that runs the agent: `claude`, `codex`, `opencode`, or a custom command. |
 | **Thread** | **The primitive.** An intent (the initial prompt) and everything done in its name: attached to 0..n projects, realized by many agent *sessions* over time, on one or many environments. States: `open → done → archived`. Live state is derived from its sessions. |
 | **Session** | One agent instance working on a thread: agent + environment + (optional) project + harness process. Owns the Rex block, the harness's own session id (for `--resume`), the transcript, status and token usage. States: `starting → running ⇄ blocked ⇄ idle → ended`. |
 | **Message** | A signed envelope from one identity (you, or an agent) addressed to identities via `p` tags. Stored in the DB. Kinds: `note`, `task`, `permission_request`, `permission_reply`, `question`, `answer`, `status`, `handoff`. |
 | **Inbox** | For an identity: messages that mention it, plus live status records from its sessions, minus what it has read (a per-identity read frontier). |
-| **Owner** | You. One Ed25519 key per environment, generated on first run, kept in the OS keychain. Signs agent attestations and your own messages. |
+| **Owner** | You. One Ed25519 key per environment, generated on first run, kept in the OS keychain. Signs agent attestations and your own messages. Once another machine's key is linked to it, that key speaks for you too (see *Linked devices*). |
 
 ## The thread model
 
@@ -128,6 +135,11 @@ signed-event lineage, minus the relay.
   | 20 | `status` | tags `s`; content = JSON `{state, kind?, title?, msg?, progress?}` |
   | 21 | `usage` | tags `s`; content = JSON delta `{input, output, cache_read, cache_write, turns, cost_usd_est}` |
   | 1,2,10–13,30 | notes, tasks, requests, replies, handoff | as before, tags `t` and optionally `s` |
+  | 120 | `owner.device` | no `t` tag; tag `["d", device]`; content = JSON `{op: link\|revoke\|label, device, label, route?}` (see *Linked devices*) |
+  | 121 | `agent.announce` | no `t` tag; tag `["d", instance]`; content = JSON `{instance, profile_id, auth}` |
+  | 122 | `agent.profile` | no `t` tag; tag `["d", profile_id]`; content = JSON profile `{profile_id, owner, name, harness, model, effort, skills, prompt, color, runtime_mode, archived}` |
+  | 123 | `team` | no `t` tag; tag `["d", team_id]`; content = JSON `{team_id, owner, name, members, skills, policy, lead, archived}` (see *Teams*) |
+  | 124 | `schedule` | no `t` tag; content = JSON `{schedule_id, op: add\|cancel, to, thread \| new_thread, prompt, when, runs_max, until, device}` (see *Scheduled work*) |
 
   All thread-scoped envelopes carry `["t", thread_id]`. Session ids are ULIDs minted by
   the starting replica (unique enough; the `s` tag binds them to the signer).
@@ -153,6 +165,43 @@ The `axel-store` crate therefore holds: `events` (the log: every envelope, with
 `thread_participants`, `sessions`, `status`, `usage`, `usage_samples`, `mentions`,
 `message_refs`, `read_frontiers`), and local-only `agents`, `environments`, `projects`.
 Writes go through typed methods that build, sign and append envelopes, then project them.
+
+## Scheduled work
+
+A **schedule** is a signed `kind 124` envelope; a **run** is an ordinary message that
+arrives in the recipient's inbox when it falls due (RFD 0006).
+
+```
+axel schedule add @reviewer --thread 01JD… --daily 09:00 [--tz +01:00] "review yesterday's merges"
+axel schedule add @scout --new "Dependency audit" --project ~/Coding/axel --every 7d "…"
+axel schedule add @atlas --thread 01JD… --at 2026-11-26T15:00:00+01:00 [--runs-max N] [--until T] "…"
+axel schedule ls [--all]  |  rm ID  |  tick
+```
+
+- **When** is a closed set: `once {at}`, `every {interval_s}` (60 s to a year, counted
+  from the schedule's `created_at`), `daily {hh, mm, tz_offset_minutes}` (a fixed offset;
+  it doesn't follow daylight saving). No cron syntax, and the time math is hand-rolled.
+- **A run** is a kind-1 note from the schedule's author to `to`, tagged `["sched",
+  schedule_id, run_number]`, sent through the same path as `axel send`: reach, chatter,
+  budget and depth, then a live note or a summons. A `new_thread` schedule opens a fresh
+  thread for every run, the way `axel thread new` records one.
+- **`axel schedule tick`** sends every run that is due on this device, as the owner
+  (whatever `$AXEL_AGENT` says). A run is recorded when its note is ingested, so a
+  second tick sends nothing new. A cron job calling it every minute is all a timer needs.
+- **Missed runs coalesce.** Occurrences are counted after the newest run, so a device
+  that slept through several sends one run whose text says how many it stands for.
+- **Limits.** `runs_max` defaults to 1000 (at most 100 000). No run fires once `until`
+  has passed. A run waits while the previous run's session is still working
+  (status `working` or session `running`); the next tick coalesces what fell due.
+- **One device fires.** The schedule names a device: today the local environment id. At
+  ingest a second run with the same `(schedule_id, run_number)` is dropped, not stored,
+  so two firing devices still deliver each run once.
+- **Who.** Only the owner arms and cancels schedules (`add`/`rm` refuse an agent's
+  process); only the author's cancel counts. A schedule signed by one of this machine's
+  agents fires under that agent's reach; anyone else's never fires here.
+- **Store.** Two projections: `schedules` (one row per schedule: the first valid `add` in
+  `(created_at, id)` order, `cancelled_at` from its author's cancel in any order) and
+  `schedule_runs (schedule_id, run_number, event_id, fired_at)`.
 
 ## The launch flow
 
@@ -195,7 +244,10 @@ $ axel                               # in any Rex terminal
      `AXEL.md`: directories, and skills.sh / GitHub skills pinned to a commit in
      `AXEL.lock`; a directory skill is linked whole, scripts and all), and links
      `AXEL.md` as `CLAUDE.md` / `AGENTS.md` (relative; when the project has its own,
-     `AXEL.md` goes into the appended system prompt instead),
+     `AXEL.md` goes into the appended system prompt instead), then every skill of every
+     live team the agent belongs to (see *Teams*),
+   - writes a **roster** of each of the agent's teams into the appended system prompt:
+     the team's name, every member's name and role, and the team's reach rule,
    - writes the owner's **standing rules** into that appended system prompt, in full:
      every global skill (`~/.config/axel/skills`) whose frontmatter says `always: true`,
      such as the coding style and the commit convention. Skills are otherwise loaded
@@ -454,9 +506,16 @@ another agent onto the selected thread; `x` ends a session.
 
 A **host** is another machine with Axel that runs agents for this one (the Mac mini at
 home, say), so you can ask, close the laptop, and find the results when you're back.
-`axel host add mini [--install]` copies this binary over SSH, installs what's missing
-(Node, Claude Code, the ACP adapter), and records the host with its **host key** (its
-Axel owner key). Claude Code must be logged in once on the host, from a pane of its own
+`axel host add mini [--install]` puts Axel in `~/.local/bin` there over SSH, installs
+what's missing (Node, Claude Code, the ACP adapter), and records the host with its
+**host key** (its Axel owner key). On a host of the same platform (`uname -sm`) it copies
+this binary. On another platform, Linux from a Mac say, it keeps an `axel` of our version
+already there, or else runs the release installer (`https://axel.md/install`) for our
+version. When there is no such release, as for a source build, an `axel` already there is
+used with a warning that the versions differ; with none, `host add` stops and says how to
+install one. It also copies the global skills (`~/.config/axel/skills`) to the same path
+there. Symlinks are followed, so skills linked in from a home repo arrive as files; a
+link to nothing, or back up to a directory holding it, is skipped with a warning. Claude Code must be logged in once on the host, from a pane of its own
 Rex (`rex -S mini run -- claude`): the keychain isn't reachable from SSH.
 
 **Asking.** `@atlas@mini …` in the composer, `axel send`, or the MCP `send` tool
@@ -525,14 +584,136 @@ Not yet: moving a session straight from one host to another (bring it home first
 moving Codex sessions, and agents on two different hosts messaging each other directly
 (it goes through the laptop's sync).
 
+## Linked devices
+
+One owner, many machines (RFD 0004, ADR 0012). Each machine keeps signing with its own
+key. `axel device link LABEL [--ssh TARGET] [--route ssh|confirm|wireguard] [--code CODE]`
+installs Axel there the way `axel host add` does and asks its key, checks the far end is
+the machine meant, asks it to consent (`axel host rpc` `consent_link`: the device signs
+`axel:device-link:v1:<owner>:<device>`), and signs a kind-120 link carrying that consent
+with this machine's key. Only after the check and the consent does it copy our skills
+there and record it as a host (`host::reach`, then `host::adopt`), so a wrong code leaves
+nothing of ours behind but the public binary that answered. A link without the device's consent is refused, so no key can
+claim another machine. From then on:
+
+- **Its key speaks for the owner.** Authorization resolves every signer to its
+  *principal*: device, then owner, at most `PRINCIPAL_DEPTH_MAX` (4) links. Roster
+  entries, participant checks and attestations compare principals, so a thread a device
+  started is the owner's, and any of the owner's machines may act on it. A home that was
+  an owner of its own, linked as a device, brings its threads and agents along with no
+  re-signing (the #40 case: two homes become one).
+- **Pairing proves the far end.** `ssh` (default): `axel host add` reached it with
+  `BatchMode=yes`, so its host key matched `known_hosts`. `confirm` and `wireguard`: both
+  machines compute an eight-digit code from the two keys (`axel device code OWNER` prints
+  it there); a code that doesn't match links nothing. `rex_tailscale` is refused until
+  `axel` can read Rex's caller identity.
+- **Everything syncs.** `sync_host` sends a linked device every thread and every owner
+  record (kinds 120-129: links, profiles, instances, schedules); a host of another owner
+  gets only the threads shared with it plus our device links. Sync first signs what
+  changed here (`device::publish`): edited profiles, new instances, this machine's label.
+  Each batch that arrives is stored with one `Store::append_all`: every thread it touches
+  is replayed once at the end, and every thread at most once when a link or an
+  announcement in it changed who may sign. The first sync of a large home therefore
+  replays each thread once, not once per agent it announces.
+- **Profiles and instances.** A profile edit is unsigned (`updated_id NULL`) until the
+  next publish; the newest `(created_at, id)` per profile wins. A profile that runs on a
+  machine for the first time gets that machine's own instance: a new key, attested by
+  the machine, announced with kind 121. `@name` resolves to this machine's instance,
+  else the one on a known host, which runs it there.
+- **Two homes, one name.** Linking a home that had agents of its own can leave two live
+  profiles of one owner with one name (#40: a `reviewer` on each). Name lookups refuse
+  to pick between them. `device link` merges the ones with the same definition
+  (`AgentProfile::same_definition`: harness, model, effort, skills, prompt and mode,
+  not colour) into the oldest, so every device picks the same survivor. The rest wait
+  for `axel device merge NAME --keep PROFILE` or `--rename PROFILE NEW_NAME`, and
+  `axel device merge` alone merges the identical ones again and lists what is left. A
+  merge is a kind-122 record of the merged profile, archived, with `merged_into`.
+  Every device moves that profile's instances to the survivor, and each announces its
+  own moved instances again. Team seats move with them.
+- **Jobs on a linked device** carry `instance: true` and no delegation: the device runs
+  its own instance of the profile, signing as itself. Hosts of other owners still get a
+  job key and a delegation (*Remote hosts*).
+- **Revocation.** `axel device revoke LABEL` signs a kind-120 revoke, from any key that
+  speaks for the owner: the device authorizes nothing signed at or after it, and it is
+  pushed to the other devices. Each link is its own row, so linking the device again
+  later leaves the revoked span unlinked; a key's first link alone vouches for what it
+  signed before. A revocation also takes back profiles, teams and instances the device
+  signed after it, even ones that arrived first, falling back to what still holds.
+- **Other owners' records stay theirs.** A profile's or team's owner never changes, and
+  sync keeps profiles, teams, instances and schedules only from keys that speak for this
+  machine's owner. A host of another owner gets only our own device links.
+- **The human's inbox** is the owner's: a message to any live device key counts on every
+  machine.
+- **Out of scope:** an offline owner key (RFD 0004 phase 8), Rex's caller identity as a
+  route, and refusing backdated envelopes from a revoked device.
+
+## Teams
+
+A team is the owner's, like an agent profile: a named set of profiles plus what they
+share (RFD 0005). Issue #40's nine-agent setup is one team instead of nine hand-kept
+policies and a coordinator prompt.
+
+```
+axel team new core --lead coordinator --member scout:"code reconnaissance" \
+    --member reviewer-spec:"reviews against the spec" --skills ./skills/core --reach lead
+axel team edit core --add auditor --remove scout --reach team
+axel team show core · axel team ls · axel team rm core
+```
+
+- **Members are profiles, not instances.** A team doesn't care which machine a member
+  runs on, and a profile may be in several teams. Members are named by agent and
+  stored as profile ids. A team has at most 32 members (`TEAM_MEMBERS_MAX`: #40's
+  team is nine). The lead is always a member; naming one adds it.
+- **Roles are text.** Axel shows them and writes them into each member's roster; it
+  never acts on a role, and never routes by one. The orchestration stays in prompts
+  and skills.
+- **Team skills** are a level between project and agent: global, project, team,
+  agent. When a member launches, every skill in every source of each of its live
+  teams is installed, parsed as `AXEL.md`'s `skills:` entries (`SkillSource`) and
+  installed the same way as the agent's. A relative directory is taken from the
+  session's work directory. A remote source is fetched as a project's is but not
+  pinned: a team has no `AXEL.lock`. A team skill wins over a project or global
+  skill of the same name.
+- **Reach.** A team's rule is `team` (members may reach each other), `lead` (the
+  lead may reach every member; members may reach the lead alone) or `none`. An
+  agent's own reach may also be `team` or `lead` (`axel agent edit --reach team`),
+  meaning the same across all its teams. The **effective reach** combines them:
+  - the agent's own rule is `anyone`, `team` or `lead`. `nobody` and a bare `--allow`
+    list set no rule: `nobody` is the default, and an untouched agent can't be told
+    from one set to nobody on purpose;
+  - its teams' rule is the union of every live team whose rule isn't `none`;
+  - with both, the stricter wins (both must allow). With one, that one applies.
+    With neither, the agent reaches nobody;
+  - the agents its own reach names (`--allow`, or the owner's "always allow") are
+    allowed on top: the owner named each one.
+
+  `axel send`, summons (`check_summon`) and the "may answer whoever may reach it"
+  rule all use the effective reach. `axel agent show` prints each team's part and
+  how they combine. A remote job carries the reach as the names it allows today,
+  since a host knows no teams.
+- **Wire.** Kind 123, on no thread, signed by the owner or one of its devices, tag
+  `["d", team_id]`, content `{team_id, owner, name, members: [{profile_id, role}],
+  skills, policy: {reach}, lead, archived}`. Latest `(created_at, id)` wins per
+  `team_id`, as for profiles. A record whose signer doesn't speak for `owner`, or
+  that names another owner's profile, is refused. One that names a profile not
+  received yet waits and is revived when the profile arrives. Local edits are
+  unsigned (`updated_id` NULL) until published; every `axel team` change publishes
+  at once, with the owner key.
+- **Archive.** `axel team rm` archives the team on every device. Its rule and its
+  skills stop applying, and members get no roster for it.
+
+Not yet: `@core` as an address, teams spanning owners, and teams scoped to a thread.
+
 ## Identity and crypto
 
 - **Curve:** Ed25519 via `ed25519-dalek` 3. Public keys are 32 bytes, shown as
   base58 (the same encoding as Solana addresses, so an agent key *is* a valid Solana
   address if you ever want it to be). Signatures are 64 bytes, verified with
   `verify_strict`.
-- **Owner key:** one per environment, generated on first run.
-- **Agent key:** generated on `axel agent new`.
+- **Owner key:** one per environment, generated on first run. It is also the machine's
+  device key: linked by another owner (kind 120), it speaks for that owner.
+- **Agent key:** one per instance, generated on `axel agent new` or the first time a
+  profile runs on a machine, attested by that machine's key.
 - **Attestation** (adapted from Buzz NIP-OA):
   `preimage = "axel:agent-auth:v1:" || agent_pubkey_b58 || ":" || conditions`,
   `sig = Ed25519(owner_sk, preimage)`. Stored as `["auth", owner_pk, conditions, sig]`.
@@ -568,8 +749,12 @@ See *The thread model* above for `threads`, `thread_projects`, `sessions`, `stat
 
 ```sql
 environments(id PK, label, rex_host_id, is_local, created_at)
-agents(pubkey PK, name UNIQUE, harness, model, effort NULL, skills_json, prompt, color,
-       runtime_mode, auth_tag_json, created_at, last_seen_at, archived_at)
+agent_profiles(profile_id PK, owner, name, harness, model, effort, skills_json, prompt,
+       color, runtime_mode, created_at, updated_at, updated_id, archived_at)
+agents(pubkey PK, profile_id, device NULL, auth_tag_json, announced_id, created_at,
+       last_seen_at, archived_at)        -- instances; device NULL = this machine
+devices(pubkey PK, owner NULL, label, route NULL, link_event_id, linked_at, revoked_at,
+       revoke_event_id)                  -- owner NULL = an owner's own label
 mentions(message_id, pubkey, PRIMARY KEY(message_id, pubkey))
 message_refs(message_id, ref_id)
 read_frontiers(pubkey, scope, through_created_at, through_id, PRIMARY KEY(pubkey, scope))

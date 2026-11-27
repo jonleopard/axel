@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use axel_i18n::t;
 use axel_acp::socket;
 use axel_inbox::Envelope;
-use axel_store::{Environment, ItemChange, SessionState, SyncStream};
+use axel_store::{OwnerRecords, Environment, ItemChange, SessionState, SyncStream};
 use serde::{Deserialize, Serialize};
 
 use super::{Ctx, launch};
@@ -80,7 +80,7 @@ fn ssh_opts() -> Vec<String> {
 
 /// `ssh` as a single string, for `GIT_SSH_COMMAND`.
 fn ssh_command_line() -> String {
-    let mut s = String::from("ssh");
+    let mut s = ssh_program();
     for o in ssh_opts() {
         s.push(' ');
         s.push_str(&shell_quote(&o));
@@ -96,9 +96,16 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// The ssh program: `ssh`, or `$AXEL_SSH` when set.  The override lets the
+/// tests stand a local directory in for another machine, and lets a user
+/// put a wrapper of their own in front of ssh.
+fn ssh_program() -> String {
+    std::env::var("AXEL_SSH").ok().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| "ssh".into())
+}
+
 /// Run `remote_cmd` (a shell command line) on `target`, feeding `stdin`.
 fn ssh(target: &str, remote_cmd: &str, stdin: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new("ssh")
+    let mut child = Command::new(ssh_program())
         .args(ssh_opts())
         .arg(target)
         .arg(remote_cmd)
@@ -163,11 +170,21 @@ fn remote_axel(args: &str) -> String {
 pub enum Request {
     Hello,
     PushEvents { events: Vec<Envelope> },
-    PullEvents { cursor: i64 },
+    PullEvents {
+        cursor: i64,
+        /// The owner the caller speaks for.  When it is this machine's owner
+        /// too, the reply carries every owner record (profiles, instances);
+        /// otherwise only device links.  Absent from older builds.
+        #[serde(default)]
+        owner: Option<String>,
+    },
     PullItems { cursor: i64 },
     PrepareRepo { repo: String },
     /// Make a key for a job (the agent delegates to it).
     JobKey,
+    /// Sign this machine's consent to `owner` linking it (RFD 0004).  Whoever
+    /// can run this over SSH can already act as this machine's user.
+    ConsentLink { owner: String },
     StartJob { job: Box<Job> },
     SessionCommand {
         session_id: String,
@@ -193,6 +210,7 @@ pub enum Response {
     Items { changes: Vec<ItemChange> },
     Repo { path: String },
     JobKey { pubkey: String },
+    Consent { device: String, consent: String },
     Started { session_id: String },
     Reply { reply: socket::Reply },
     Branches { branches: Vec<RemoteBranch> },
@@ -232,6 +250,10 @@ pub struct JobAgent {
     pub prompt: Option<String>,
     pub color: Option<axel_store::AgentColor>,
     pub auth_tag: Option<Vec<String>>,
+    /// The profile it instantiates, so two owners' agents of one name stay
+    /// apart here.  Absent from a build that predates profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 fn known_effort<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<axel_store::Effort>, D::Error> {
@@ -250,6 +272,7 @@ impl JobAgent {
             prompt: a.prompt.clone(),
             color: a.color,
             auth_tag: a.auth_tag.clone(),
+            profile_id: Some(a.profile_id.clone()),
         }
     }
 
@@ -266,6 +289,8 @@ impl JobAgent {
                 color: self.color,
                 runtime_mode: mode,
                 auth_tag: self.auth_tag.clone(),
+                profile_id: self.profile_id.clone(),
+                device: None,
             })?;
         }
         Ok(())
@@ -314,6 +339,11 @@ pub struct Job {
     /// The agents it may reach, so `@name` resolves on the host.
     #[serde(default)]
     pub peers: Vec<JobAgent>,
+    /// The host is another device of the agent's owner: it runs its own
+    /// instance of the agent's profile, signing as itself, and `job_key`
+    /// and `delegation` are empty (RFD 0004).
+    #[serde(default)]
+    pub instance: bool,
 }
 
 /// A job branch on the host, and a snapshot of its uncommitted work.
@@ -361,15 +391,15 @@ fn handle(req: Request) -> Result<Response> {
     Ok(match req {
         Request::Hello => hello(&ctx)?,
         Request::PushEvents { events } => {
-            let mut applied = 0;
-            for e in &events {
-                if ctx.store.append(e)?.projected {
-                    applied += 1;
-                }
-            }
+            let applied = ingest(&ctx, &events)?.iter().filter(|(_, r)| r.projected).count();
             Response::Pushed { applied }
         }
-        Request::PullEvents { cursor } => Response::Events { events: ctx.store.thread_events_since(cursor, None, BATCH)? },
+        Request::ConsentLink { owner } => {
+            let owner: axel_identity::PublicKey = owner.parse()?;
+            let key = ctx.owner()?;
+            Response::Consent { device: key.public().to_base58(), consent: axel_identity::consent_to_link(&key, &owner) }
+        }
+        Request::PullEvents { cursor, owner } => pull_events(&ctx, cursor, owner.as_deref())?,
         Request::PullItems { cursor } => {
             let env = ctx.store.local_environment()?;
             Response::Items { changes: ctx.store.item_changes_since(&env.id, cursor, BATCH)? }
@@ -418,6 +448,47 @@ fn handle(req: Request) -> Result<Response> {
 }
 
 /// Who this host is, and what it lacks to run agents.
+/// Store envelopes from another machine.  Device links go first, so the
+/// owner records after them are judged with them in place; then a profile,
+/// team, instance or schedule is kept only from a key that speaks for this
+/// machine's owner.  Another owner's records are never ours to keep: they
+/// would put their agents in our lists, and our launcher.
+///
+/// One `append_all` for the whole batch, so the initial sync of a large home
+/// replays every thread once, not once per agent it announces.
+fn ingest(ctx: &Ctx, events: &[Envelope]) -> Result<Vec<(Envelope, axel_store::Appended)>> {
+    let (links, rest): (Vec<Envelope>, Vec<Envelope>) = events.iter().cloned().partition(|e| e.kind == axel_store::kind::OWNER_DEVICE);
+    let ordered: Vec<Envelope> = links.into_iter().chain(rest).collect();
+    let my_key = ctx.owner()?.public().to_base58();
+    // Asked right before each envelope is stored, so the links above it are
+    // in place when an owner record's signer is resolved.
+    let keep = |e: &Envelope| -> Result<bool, axel_store::Error> {
+        if e.kind == axel_store::kind::OWNER_DEVICE || !axel_inbox::kind::is_owner_record(e.kind) {
+            return Ok(true);
+        }
+        Ok(ctx.store.principal(&e.from)? == ctx.store.principal(&my_key)?)
+    };
+    let outcomes = ctx.store.append_all(&ordered, keep)?;
+    assert_eq!(outcomes.len(), ordered.len(), "one outcome per envelope");
+    let out: Vec<(Envelope, axel_store::Appended)> =
+        ordered.into_iter().zip(outcomes).filter_map(|(e, outcome)| outcome.map(|o| (e, o))).collect();
+    debug_assert!(out.len() <= events.len());
+    Ok(out)
+}
+
+/// Every thread's envelopes after `cursor`, and the owner records the
+/// caller may have.  What this machine changed is signed first, so it goes.
+fn pull_events(ctx: &Ctx, cursor: i64, caller_owner: Option<&str>) -> Result<Response> {
+    let me = ctx.store.principal(&ctx.owner()?.public().to_base58())?;
+    let records = if caller_owner == Some(me.as_str()) {
+        super::device::publish(ctx)?;
+        OwnerRecords::All
+    } else {
+        OwnerRecords::Links
+    };
+    Ok(Response::Events { events: ctx.store.thread_events_since(cursor, None, records, BATCH)? })
+}
+
 fn hello(ctx: &Ctx) -> Result<Response> {
     let env = ctx.store.local_environment()?;
     // The Claude adapter is built into axel; node only matters to install Claude Code.
@@ -456,29 +527,28 @@ fn session_command(ctx: &Ctx, session_id: &str, mut cmd: socket::Command, files:
 /// what it needs, and record it here.
 pub fn add(label: &str, ssh_target: Option<&str>, install: bool) -> Result<()> {
     let ctx = Ctx::open()?;
+    let reached = reach(label, ssh_target)?;
+    adopt(&ctx, &reached, install)
+}
+
+/// A machine reached over SSH and running our version of Axel, which said
+/// its key.  Nothing of ours is on it yet beyond that binary, and nothing
+/// here records it: [`adopt`] does both, once the caller trusts it.
+pub struct Reached {
+    /// The machine as a host row would hold it, with the key it said it has.
+    pub host: Environment,
+    remote_label: String,
+    missing: Vec<String>,
+}
+
+/// Reach `label` (over `ssh_target`, or the label itself), make sure it runs
+/// this version of Axel, and ask its key.  The binary has to be there first:
+/// it is what answers.  It is the same public build anyone can download, so
+/// putting it on a machine we haven't verified yet gives nothing away.
+pub fn reach(label: &str, ssh_target: Option<&str>) -> Result<Reached> {
     let target = ssh_target.unwrap_or(label);
-    let here = String::from_utf8(Command::new("uname").arg("-sm").output()?.stdout)?.trim().to_string();
-    let there = String::from_utf8(ssh(target, "uname -sm", b"")?)?.trim().to_string();
-    if here != there {
-        bail!("{}", t!("{target} is {there}, this machine is {here}: copying this axel binary won't run there", target = target, there = there, here = here));
-    }
-    println!("{}", t!("{target}: {there}, reachable", target = target, there = there));
-
-    let exe = std::fs::read(std::env::current_exe()?)?;
-    ssh(
-        target,
-        "mkdir -p .local/bin && cat > .local/bin/axel.new && chmod +x .local/bin/axel.new && mv .local/bin/axel.new .local/bin/axel",
-        &exe,
-    )?;
-    println!("{}", t!("installed axel {version} in ~/.local/bin", version = env!("CARGO_PKG_VERSION")));
-
-    let skills = paths::global_skills_dir();
-    if skills.is_dir() {
-        copy_dir(target, &skills)?;
-        println!("{}", t!("copied your skills ({path})", path = skills.display()));
-    }
-
-    let probe = Environment {
+    place_binary(target)?;
+    let mut host = Environment {
         id: String::new(),
         label: label.into(),
         rex_host_id: None,
@@ -487,19 +557,38 @@ pub fn add(label: &str, ssh_target: Option<&str>, install: bool) -> Result<()> {
         ssh_target: Some(target.into()),
         host_pubkey: None,
     };
-    let Response::Hello { environment_id, label: remote_label, host_pubkey, missing, .. } = call(&probe, &Request::Hello)? else {
+    let Response::Hello { environment_id, label: remote_label, host_pubkey, missing, .. } = call(&host, &Request::Hello)? else {
         bail!("{}", t!("unexpected reply to hello"));
     };
-    let mut missing = missing;
+    assert!(!host_pubkey.is_empty(), "a host always says its key");
+    host.id = environment_id;
+    host.host_pubkey = Some(host_pubkey);
+    Ok(Reached { host, remote_label, missing })
+}
+
+/// Give a reached machine what it needs to run our agents (our skills, and
+/// with `install` its missing tools) and record it as a host.  Only once the
+/// caller trusts it: the skills are ours, and a host row is trusted for sync.
+pub fn adopt(ctx: &Ctx, reached: &Reached, install: bool) -> Result<()> {
+    let host = &reached.host;
+    let label = host.label.as_str();
+    let target = host.ssh_target.as_deref().expect("a reached host has its ssh target");
+    let host_pubkey = host.host_pubkey.as_deref().expect("a reached host said its key");
+    let skills = paths::global_skills_dir();
+    if skills.is_dir() {
+        copy_dir(target, &skills)?;
+        println!("{}", t!("copied your skills ({path})", path = skills.display()));
+    }
+    let mut missing = reached.missing.clone();
     if !missing.is_empty() && install {
         install_deps(target, &missing)?;
-        if let Response::Hello { missing: m, .. } = call(&probe, &Request::Hello)? {
+        if let Response::Hello { missing: m, .. } = call(host, &Request::Hello)? {
             missing = m;
         }
     }
     let rex_host = rex_host_label(label);
-    ctx.store.put_host(&environment_id, label, target, &host_pubkey, rex_host.as_deref())?;
-    println!("{}", t!("{label}: host key {key} ({remote})", label = label, key = host_pubkey, remote = remote_label));
+    ctx.store.put_host(&host.id, label, target, host_pubkey, rex_host.as_deref())?;
+    println!("{}", t!("{label}: host key {key} ({remote})", label = label, key = host_pubkey, remote = reached.remote_label));
     if rex_host.is_some() {
         println!("{}", t!("Rex host {label}: remote jobs will run in its `{session}` session", label = label, session = REX_SESSION));
     }
@@ -509,6 +598,103 @@ pub fn add(label: &str, ssh_target: Option<&str>, install: bool) -> Result<()> {
         println!("{}", t!("missing on {target}: {missing}. Rerun with --install, or install them yourself.", target = target, missing = missing.join(", ")));
     }
     Ok(())
+}
+
+/// The release installer.  It checks each download's sha256, and its build
+/// provenance when `gh` is logged in, before installing into `~/.local/bin`.
+const INSTALLER_URL: &str = "https://axel.md/install";
+
+/// Make `~/.local/bin/axel` on `target` an axel that can answer us: this
+/// very binary on a machine of the same platform, else a release build.
+fn place_binary(target: &str) -> Result<()> {
+    let here = String::from_utf8(Command::new("uname").arg("-sm").output()?.stdout)?.trim().to_string();
+    let there = String::from_utf8(ssh(target, "uname -sm", b"")?)?.trim().to_string();
+    println!("{}", t!("{target}: {there}, reachable", target = target, there = there));
+    if here == there {
+        copy_binary(target)
+    } else {
+        place_release(target, &here, &there)
+    }
+}
+
+/// Copy this binary to `~/.local/bin/axel` on `target`.
+fn copy_binary(target: &str) -> Result<()> {
+    let exe = std::fs::read(std::env::current_exe()?)?;
+    ssh(
+        target,
+        "mkdir -p .local/bin && cat > .local/bin/axel.new && chmod +x .local/bin/axel.new && mv .local/bin/axel.new .local/bin/axel",
+        &exe,
+    )?;
+    println!("{}", t!("installed axel {version} in ~/.local/bin", version = env!("CARGO_PKG_VERSION")));
+    Ok(())
+}
+
+/// On a machine of another platform (Linux from a Mac, say) this binary
+/// can't run.  Use the axel already there if it is our version; otherwise
+/// install the release of our version.  When there is no such release (a
+/// source build) and the machine already has an axel, use that one and say
+/// the versions differ: the requests between versions only add fields.
+fn place_release(target: &str, here: &str, there: &str) -> Result<()> {
+    let ours = env!("CARGO_PKG_VERSION");
+    let before = remote_version(target)?;
+    if before.as_deref() == Some(ours) {
+        println!("{}", t!("{target} already has axel {version}", target = target, version = ours));
+        return Ok(());
+    }
+    let installer = install_release(target, ours);
+    let after = remote_version(target)?;
+    match (after, installer) {
+        (Some(version), _) if version == ours => {
+            println!("{}", t!("installed the axel {version} release in ~/.local/bin", version = ours));
+            Ok(())
+        }
+        (Some(version), installer) => {
+            let why = installer.err().map_or_else(|| t!("the installer put another version there").to_string(), |e| format!("{e:#}"));
+            eprintln!(
+                "{}",
+                t!("{target}: using its axel {theirs}; this machine runs {ours}, which couldn't be installed there ({why})",
+                    target = target, theirs = version, ours = ours, why = why)
+            );
+            Ok(())
+        }
+        (None, installer) => {
+            let why = installer.err().map_or_else(|| t!("the installer left no axel that runs").to_string(), |e| format!("{e:#}"));
+            bail!(
+                "{}",
+                t!("{target} is {there}, this machine is {here}: this binary won't run there, and installing axel {version} failed ({why}). Install axel there (curl -fsSL {url} | sh), then rerun.",
+                    target = target, there = there, here = here, version = ours, why = why, url = INSTALLER_URL)
+            )
+        }
+    }
+}
+
+/// Run the release installer on `target` for `version`.  The script is
+/// fetched whole before `sh` runs it, so a failed download fails here with
+/// curl's error instead of piping nothing into `sh`, which exits 0.  The
+/// caller still asks the installed binary its version afterwards.
+fn install_release(target: &str, version: &str) -> Result<()> {
+    assert!(
+        !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.'),
+        "a crate version is digits and dots: {version}"
+    );
+    println!("{}", t!("{target}: installing the axel {version} release", target = target, version = version));
+    ssh(
+        target,
+        &format!(
+            "installer=$(curl -fsSL {INSTALLER_URL}) && printf '%s\\n' \"$installer\" | AXEL_INSTALL_DIR=\"$HOME/.local/bin\" sh -s -- {version}"
+        ),
+        b"",
+    )?;
+    Ok(())
+}
+
+/// The version `~/.local/bin/axel` on `target` reports, if one is there and
+/// runs.  One of another platform doesn't run, and reads as none.
+fn remote_version(target: &str) -> Result<Option<String>> {
+    let out = ssh(target, "\"$HOME/.local/bin/axel\" --version 2>/dev/null || true", b"")?;
+    let text = String::from_utf8_lossy(&out);
+    let version = text.lines().next().and_then(|l| l.trim().strip_prefix("axel ")).map(str::trim);
+    Ok(version.filter(|v| !v.is_empty()).map(String::from))
 }
 
 fn install_deps(target: &str, missing: &[String]) -> Result<()> {
@@ -542,15 +728,86 @@ fn rex_host_label(label: &str) -> Option<String> {
 }
 
 /// Copy `dir` to the same path under the host's home.
+///
+/// Symlinks are followed: skills linked in from a home repo arrive as the
+/// files they point at, not as links to paths that exist only here.  We
+/// follow them ourselves rather than with `tar -h`, because GNU and BSD tar
+/// treat a link to nothing differently; here it is skipped with a warning.
 fn copy_dir(target: &str, dir: &Path) -> Result<()> {
     let home = dirs::home_dir().context(t!("no home directory"))?;
     let rel = dir.strip_prefix(&home).with_context(|| t!("{path} is outside your home", path = dir.display()))?;
-    let tar = Command::new("tar").arg("-C").arg(dir).args(["-cf", "-", "."]).output()?;
+    let staging = tempfile::tempdir().context(t!("making a temporary directory"))?;
+    let mut copied = CopyTotals::default();
+    let mut ancestors = vec![std::fs::canonicalize(dir).with_context(|| dir.display().to_string())?];
+    stage_dir(dir, staging.path(), &mut ancestors, &mut copied)?;
+    let tar = Command::new("tar").arg("-C").arg(staging.path()).args(["-cf", "-", "."]).output()?;
     if !tar.status.success() {
         bail!("tar {}: {}", dir.display(), String::from_utf8_lossy(&tar.stderr));
     }
     let rel = shell_quote(&rel.to_string_lossy());
     ssh(target, &format!("mkdir -p {rel} && tar -C {rel} -xf -"), &tar.stdout)?;
+    Ok(())
+}
+
+/// The deepest directory [`stage_dir`] descends to.  Skills nest two or
+/// three levels.  Symlink loops are caught before this, by their target.
+const COPY_DEPTH_MAX: usize = 16;
+/// The most files one copy carries.  A skills directory holds tens.
+const COPY_FILES_MAX: u64 = 10_000;
+/// The most bytes one copy carries.  Skills are text; this is far past any
+/// real set, and well under what one SSH round trip should move.
+const COPY_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// What [`stage_dir`] has copied so far, checked against the limits.
+#[derive(Debug, Default)]
+struct CopyTotals {
+    files: u64,
+    bytes: u64,
+}
+
+/// Copy `from`'s contents into `to` (an existing directory), following
+/// symlinks.  `ancestors` holds the resolved paths of `from` and the
+/// directories above it.  A link to nothing, or back up to one of those (a
+/// loop), is skipped with a warning; we check rather than wait for the OS's
+/// own limit, which differs between macOS and Linux.  Anything but files
+/// and directories (sockets, fifos) is skipped: skills never hold them.
+fn stage_dir(from: &Path, to: &Path, ancestors: &mut Vec<PathBuf>, copied: &mut CopyTotals) -> Result<()> {
+    assert!(!ancestors.is_empty(), "the resolved `from` is the last ancestor");
+    if ancestors.len() > COPY_DEPTH_MAX {
+        bail!("{}", t!("{path} is more than {max} directories deep", path = from.display(), max = COPY_DEPTH_MAX));
+    }
+    debug_assert!(to.is_dir(), "the destination exists before it is filled");
+    for entry in std::fs::read_dir(from).with_context(|| from.display().to_string())? {
+        let path = entry?.path();
+        let name = path.file_name().expect("a directory entry has a name");
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{}", t!("skipping {path}: {error}", path = path.display(), error = e));
+                continue;
+            }
+        };
+        let dest = to.join(name);
+        if metadata.is_dir() {
+            let resolved = std::fs::canonicalize(&path).with_context(|| path.display().to_string())?;
+            if ancestors.contains(&resolved) {
+                eprintln!("{}", t!("skipping {path}: it links back to a directory that holds it", path = path.display()));
+                continue;
+            }
+            std::fs::create_dir(&dest)?;
+            ancestors.push(resolved);
+            let staged = stage_dir(&path, &dest, ancestors, copied);
+            ancestors.pop();
+            staged?;
+        } else if metadata.is_file() {
+            copied.files = copied.files.saturating_add(1);
+            copied.bytes = copied.bytes.saturating_add(metadata.len());
+            if copied.files > COPY_FILES_MAX || copied.bytes > COPY_BYTES_MAX {
+                bail!("{}", t!("more than {files} files or {mib} MiB to copy (at {path})", path = from.display(), files = COPY_FILES_MAX, mib = COPY_BYTES_MAX / (1024 * 1024)));
+            }
+            std::fs::copy(&path, &dest).with_context(|| path.display().to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -603,13 +860,29 @@ const SYNC_BATCHES_MAX: usize = 2000;
 pub fn sync_host(ctx: &Ctx, host: &Environment, with_git: bool) -> Result<SyncReport> {
     let mut report = SyncReport::default();
     let shared = ctx.store.shared_threads(&host.id)?;
+    // Another device of ours gets every thread and every owner record; a
+    // host of another owner only the threads we share and our device links.
+    let linked = super::device::is_linked(ctx, host)?;
+    if linked {
+        super::device::publish(ctx)?;
+    }
+    let (threads, records) = if linked { (None, OwnerRecords::All) } else { (Some(shared.as_slice()), OwnerRecords::Links) };
+    let me = ctx.store.principal(&ctx.owner()?.public().to_base58())?;
     let mut cursor = ctx.store.peer_cursor(&host.id, SyncStream::EventsOut)?;
     for _ in 0..SYNC_BATCHES_MAX {
-        let batch = ctx.store.thread_events_since(cursor, Some(&shared), BATCH)?;
+        let batch = ctx.store.thread_events_since(cursor, threads, records, BATCH)?;
         let Some((last, _)) = batch.last() else { break };
         let last = *last;
         let n = batch.len();
-        call(host, &Request::PushEvents { events: batch.into_iter().map(|(_, e)| e).collect() })?;
+        let mut events = Vec::with_capacity(n);
+        for (_, e) in batch {
+            // A host of another owner gets our own device links only, not
+            // the links of third parties we happen to hold.
+            if linked || !axel_inbox::kind::is_owner_record(e.kind) || ctx.store.principal(&e.from)? == me {
+                events.push(e);
+            }
+        }
+        call(host, &Request::PushEvents { events })?;
         report.pushed += n;
         cursor = last;
         ctx.store.set_peer_cursor(&host.id, SyncStream::EventsOut, cursor)?;
@@ -620,16 +893,18 @@ pub fn sync_host(ctx: &Ctx, host: &Environment, with_git: bool) -> Result<SyncRe
     let mut cursor = ctx.store.peer_cursor(&host.id, SyncStream::EventsIn)?;
     let mut notes = Vec::new();
     for _ in 0..SYNC_BATCHES_MAX {
-        let Response::Events { events } = call(host, &Request::PullEvents { cursor })? else { bail!("{}", t!("unexpected reply")) };
+        let Response::Events { events } = call(host, &Request::PullEvents { cursor, owner: Some(me.clone()) })? else { bail!("{}", t!("unexpected reply")) };
         let n = events.len();
-        for (seq, e) in &events {
-            let r = ctx.store.append(e)?;
+        let envelopes: Vec<Envelope> = events.iter().map(|(_, e)| e.clone()).collect();
+        for (e, r) in ingest(ctx, &envelopes)? {
             if r.inserted {
                 report.pulled += 1;
                 if r.projected && e.kind == axel_inbox::kind::NOTE {
                     notes.push(e.clone());
                 }
             }
+        }
+        if let Some((seq, _)) = events.last() {
             cursor = *seq;
         }
         ctx.store.set_peer_cursor(&host.id, SyncStream::EventsIn, cursor)?;
@@ -864,6 +1139,12 @@ pub fn placement(ctx: &Ctx, agent: &str, asked: Option<&str>) -> Result<Placemen
         let host = ctx.store.host(h)?.with_context(|| t!("no host named {quoted}; add it with `axel host add {label}`", quoted = format!("{h:?}"), label = h))?;
         return Ok(Placement::Host(host));
     }
+    // A profile whose only instance runs on another device of ours runs there.
+    if let Some(device) = ctx.store.agent_by_pubkey(agent)?.and_then(|a| a.device)
+        && let Some(host) = ctx.store.hosts()?.into_iter().find(|h| h.host_pubkey.as_deref() == Some(device.as_str()))
+    {
+        return Ok(Placement::Host(host));
+    }
     // Delegated work runs where it was sent; only the agent's home re-routes.
     let home = agent.parse().ok().and_then(|k| ctx.keystore.agent(&k).ok().flatten()).is_some();
     Ok(match ctx.store.agent_host(agent)? {
@@ -886,6 +1167,27 @@ pub fn launch_remote(ctx: &Ctx, host_label: &str, thread_id: &str, agent_name: &
     start_remote(ctx, &host, thread_id, agent_name, prompt, files, None)
 }
 
+/// The agents a job's agent may reach, and the reach to record on the host.
+/// A host knows no teams, so when a team's rule takes part the reach goes
+/// as the names it allows today.
+fn job_reach(ctx: &Ctx, agent: &axel_store::Agent, own: axel_store::Reach) -> Result<(Vec<JobAgent>, axel_store::Reach)> {
+    let effective = ctx.store.effective_reach(&agent.pubkey)?;
+    let peers: Vec<JobAgent> = ctx
+        .store
+        .list_agents()?
+        .iter()
+        .filter(|a| a.pubkey != agent.pubkey && effective.allows(&a.pubkey, Some(&a.profile_id)))
+        .map(JobAgent::of)
+        .collect();
+    if !effective.from_teams() {
+        return Ok((peers, own));
+    }
+    let names: Vec<String> = peers.iter().map(|p| p.pubkey.clone()).collect();
+    let reach = if names.is_empty() { axel_store::Reach::Nobody } else { axel_store::Reach::Only(names) };
+    debug_assert!(!matches!(reach, axel_store::Reach::Team(_) | axel_store::Reach::Lead(_)), "a host gets names, not team rules");
+    Ok((peers, reach))
+}
+
 /// A conversation to resume on the host, and the directory whose state
 /// goes with it.
 struct Carry {
@@ -897,58 +1199,48 @@ fn start_remote(ctx: &Ctx, host: &Environment, thread_id: &str, agent_name: &str
     let thread = ctx.store.get_thread(thread_id)?.with_context(|| t!("no thread {id}", id = thread_id))?;
     let agent = ctx.store.agent_by_name(agent_name)?.with_context(|| t!("no agent named {name}", name = format!("{agent_name:?}")))?;
     super::policy::check_summon(ctx, &agent.pubkey).with_context(|| t!("refusing to launch {name}", name = agent.name))?;
-    let agent_kp = ctx
-        .keystore
-        .agent(&agent.pubkey.parse()?)?
-        .with_context(|| t!("{name}'s key isn't on this machine, so it can't delegate", name = agent.name))?;
     if super::claude_profile::ClaudeProfile::load(&agent.pubkey)?.is_some() {
         bail!("{}", t!("{name} has a machine-local Claude config directory and must run locally", name = agent.name));
     }
     let attachments = pack_files(files)?;
+    // Another device of ours runs its own instance; any other host works
+    // under a delegation from the agent's key here.
+    let instance = super::device::is_linked(ctx, host)?;
 
     // The thread, in full (the host may have none of it).
     ctx.store.share_thread(&host.id, &thread.id)?;
-    let events = ctx.store.thread_events(&thread.id)?;
-    for chunk in events.chunks(BATCH) {
-        call(host, &Request::PushEvents { events: chunk.to_vec() })?;
+    if instance {
+        // Every thread and the agent's profile, which the host needs first.
+        sync_host(ctx, host, false)?;
+    } else {
+        let events = ctx.store.thread_events(&thread.id)?;
+        for chunk in events.chunks(BATCH) {
+            call(host, &Request::PushEvents { events: chunk.to_vec() })?;
+        }
     }
 
     let workspace = send_workspace(ctx, host, &thread, &agent.name, carry.as_ref())?;
-
-    let Response::JobKey { pubkey: job_key } = call(host, &Request::JobKey)? else { bail!("{}", t!("unexpected reply")) };
-    let now_secs = u64::try_from(axel_tui::util::now_secs()).context("the clock is before 1970")?;
-    let delegation = axel_identity::delegate(
-        &agent_kp,
-        &job_key.parse()?,
-        &thread.id,
-        now_secs.saturating_sub(DELEGATION_CLOCK_SKEW_SECS),
-        now_secs.saturating_add(DELEGATION_SECS),
-    )?;
+    let (job_key, delegation) = if instance { (String::new(), vec![]) } else { delegate_to_host(ctx, host, &agent, &thread.id)? };
     let from = super::policy::caller_agent()
         .filter(|pk| *pk != agent.pubkey)
         .map(|pk| socket::Sender::new(pk.clone(), super::policy::name_of(ctx, &pk)));
     let policy = ctx.store.agent_policy(&agent.pubkey)?;
-    let peers = ctx
-        .store
-        .list_agents()?
-        .iter()
-        .filter(|a| a.pubkey != agent.pubkey && policy.reach.allows(&a.pubkey))
-        .map(JobAgent::of)
-        .collect();
+    let (peers, reach) = job_reach(ctx, &agent, policy.reach)?;
     let job = Job {
         thread_id: thread.id.clone(),
         title: thread.title.clone(),
         agent: JobAgent::of(&agent),
         job_key,
-        delegation: delegation.to_tag(),
+        delegation,
         prompt: remote_prompt(prompt, workspace.as_ref(), &host.label),
         from,
         workspace,
         attachments,
         resume: carry.map(|c| c.transcript),
-        reach: policy.reach,
+        reach,
         budget: policy.budget,
         peers,
+        instance,
     };
     let Response::Started { session_id } = call(host, &Request::StartJob { job: Box::new(job) })? else {
         bail!("{}", t!("unexpected reply"));
@@ -957,6 +1249,37 @@ fn start_remote(ctx: &Ctx, host: &Environment, thread_id: &str, agent_name: &str
     let _ = sync_host(ctx, host, false);
     ensure_follower(host);
     Ok(session_id)
+}
+
+/// `host`'s consent to `owner` linking it, checked to be from the key the
+/// host said it has.
+pub fn ask_consent(host: &Environment, owner: &axel_identity::PublicKey) -> Result<String> {
+    let Response::Consent { device, consent } = call(host, &Request::ConsentLink { owner: owner.to_base58() })? else {
+        bail!("{}", t!("unexpected reply"));
+    };
+    if host.host_pubkey.as_deref() != Some(device.as_str()) {
+        bail!("{}", t!("{host} answered with another key than the one it said it has", host = host.label));
+    }
+    axel_identity::verify_link_consent(owner, &device.parse()?, &consent)?;
+    Ok(consent)
+}
+
+/// A key on `host` for the job, and `agent`'s delegation to it for `thread_id`.
+fn delegate_to_host(ctx: &Ctx, host: &Environment, agent: &axel_store::Agent, thread_id: &str) -> Result<(String, Vec<String>)> {
+    let agent_kp = ctx
+        .keystore
+        .agent(&agent.pubkey.parse()?)?
+        .with_context(|| t!("{name}'s key isn't on this machine, so it can't delegate", name = agent.name))?;
+    let Response::JobKey { pubkey: job_key } = call(host, &Request::JobKey)? else { bail!("{}", t!("unexpected reply")) };
+    let now_secs = u64::try_from(axel_tui::util::now_secs()).context("the clock is before 1970")?;
+    let delegation = axel_identity::delegate(
+        &agent_kp,
+        &job_key.parse()?,
+        thread_id,
+        now_secs.saturating_sub(DELEGATION_CLOCK_SKEW_SECS),
+        now_secs.saturating_add(DELEGATION_SECS),
+    )?;
+    Ok((job_key, delegation.to_tag()))
 }
 
 /// How far back a delegation's validity starts, for a host whose clock runs
@@ -1453,8 +1776,13 @@ fn record_job_agent(ctx: &Ctx, job: &Job) -> Result<()> {
 /// Run a job on this host: learn the agent, hold its delegation, check out
 /// its branch, and start a managed session in the `axel` Rex session.
 fn start_job(ctx: &Ctx, job: &Job) -> Result<String> {
-    accept_delegation(ctx, job)?;
-    record_job_agent(ctx, job)?;
+    let agent_pubkey = if job.instance {
+        job_instance(ctx, job)?
+    } else {
+        accept_delegation(ctx, job)?;
+        record_job_agent(ctx, job)?;
+        job.agent.pubkey.clone()
+    };
     let work_dir = job_work_dir(job)?;
 
     let attachments = unpack_files(&paths::home().join("attachments").join(id_prefix(&job.thread_id)), &job.attachments)?;
@@ -1468,7 +1796,7 @@ fn start_job(ctx: &Ctx, job: &Job) -> Result<String> {
     let req = axel_tui::LaunchRequest {
         title: job.title.clone(),
         projects: vec![],
-        agent_pubkey: job.agent.pubkey.clone(),
+        agent_pubkey,
         workspace: axel_store::WorkspaceKind::InPlace,
         branch: None,
         thread_id: Some(job.thread_id.clone()),
@@ -1503,6 +1831,27 @@ fn start_job(ctx: &Ctx, job: &Job) -> Result<String> {
         launch::spawn_detached(&spec, &session_id)?;
     }
     Ok(session_id)
+}
+
+/// A job from another device of our owner: this machine's own instance of
+/// the agent's profile runs it, made now if it is the first time, under the
+/// policy the job carries.  Returns the instance's key.
+fn job_instance(ctx: &Ctx, job: &Job) -> Result<String> {
+    ctx.store.get_thread(&job.thread_id)?.context("the thread hasn't arrived here yet")?;
+    let profile_id = job.agent.profile_id.as_deref().context("a job for an instance names its profile")?;
+    let profile = ctx.store.profile(profile_id)?.context("the agent's profile hasn't arrived here yet")?;
+    let me = ctx.store.principal(&ctx.owner()?.public().to_base58())?;
+    let owner = profile.owner.as_deref().context("the agent's profile has no owner")?;
+    if ctx.store.principal(owner)? != me {
+        bail!("{} belongs to another owner: its jobs need a delegation", profile.name);
+    }
+    let agent = super::device::local_instance(ctx, profile_id)?;
+    for p in &job.peers {
+        p.insert_if_missing(ctx, axel_store::RuntimeMode::Autopilot)?;
+    }
+    ctx.store.set_agent_policy(&agent.pubkey, &axel_store::AgentPolicy { reach: job.reach.clone(), budget: job.budget })?;
+    debug_assert_eq!(agent.profile_id, profile_id);
+    Ok(agent.pubkey)
 }
 
 /// Check a job's delegation (made here, for this thread, from its agent,
@@ -1629,6 +1978,72 @@ pub fn snapshot_commit(dir: &Path, message: &str) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn skills_linked_in_from_a_home_repo_copy_as_their_files() {
+        let root = tempfile::tempdir().unwrap();
+        let home_repo = root.path().join("home-repo").join("review");
+        std::fs::create_dir_all(&home_repo).unwrap();
+        std::fs::write(home_repo.join("SKILL.md"), "review rules").unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir_all(skills.join("local")).unwrap();
+        std::fs::write(skills.join("local").join("SKILL.md"), "local rules").unwrap();
+        std::os::unix::fs::symlink(&home_repo, skills.join("review")).unwrap();
+        std::os::unix::fs::symlink(home_repo.join("SKILL.md"), skills.join("one-file.md")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("nowhere"), skills.join("dangling")).unwrap();
+
+        let staged = tempfile::tempdir().unwrap();
+        let mut copied = CopyTotals::default();
+        stage(&skills, staged.path(), &mut copied).unwrap();
+
+        let review = staged.path().join("review");
+        assert!(std::fs::symlink_metadata(&review).unwrap().is_dir(), "a linked skill is a real directory");
+        assert_eq!(std::fs::read_to_string(review.join("SKILL.md")).unwrap(), "review rules");
+        assert!(std::fs::symlink_metadata(staged.path().join("one-file.md")).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(staged.path().join("local").join("SKILL.md")).unwrap(), "local rules");
+        assert!(std::fs::symlink_metadata(staged.path().join("dangling")).is_err(), "a link to nothing is skipped");
+        assert_eq!(copied.files, 3);
+    }
+
+    /// Stage `dir` the way [`copy_dir`] does.
+    fn stage(dir: &Path, staged: &Path, copied: &mut CopyTotals) -> Result<()> {
+        stage_dir(dir, staged, &mut vec![std::fs::canonicalize(dir).unwrap()], copied)
+    }
+
+    #[test]
+    fn a_symlink_loop_in_the_skills_is_skipped() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir_all(skills.join("review")).unwrap();
+        std::fs::write(skills.join("review").join("SKILL.md"), "rules").unwrap();
+        std::os::unix::fs::symlink(&skills, skills.join("review").join("up")).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let mut copied = CopyTotals::default();
+        stage(&skills, staged.path(), &mut copied).unwrap();
+        assert!(staged.path().join("review").join("SKILL.md").is_file());
+        assert!(std::fs::symlink_metadata(staged.path().join("review").join("up")).is_err(), "the loop is not followed");
+        assert_eq!(copied.files, 1);
+    }
+
+    #[test]
+    fn skills_nested_past_the_depth_limit_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = (0..=COPY_DEPTH_MAX).fold(root.path().to_path_buf(), |p, i| p.join(format!("d{i}")));
+        std::fs::create_dir_all(&deep).unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let error = stage(root.path(), staged.path(), &mut CopyTotals::default()).unwrap_err();
+        assert!(format!("{error:#}").contains("directories deep"), "{error:#}");
+    }
+
+    #[test]
+    fn skills_past_the_file_limit_are_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("SKILL.md"), "x").unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let mut copied = CopyTotals { files: COPY_FILES_MAX, bytes: 0 };
+        let error = stage(root.path(), staged.path(), &mut copied).unwrap_err();
+        assert!(format!("{error:#}").contains("to copy"), "{error:#}");
+    }
+
     fn repo() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         for args in [
@@ -1744,6 +2159,89 @@ mod tests {
         assert_eq!(serde_json::from_value::<JobAgent>(unknown).unwrap().name, "atlas");
     }
 
+    /// A host whose key `home` linked, holding `home`'s profile `reviewer`.
+    fn linked_host(temp: &Path, home: &axel_identity::Keypair, profile_owner: &axel_identity::Keypair) -> (Ctx, String, String) {
+        use axel_inbox::EnvelopeBuilder;
+        let host = Ctx { store: axel_store::Store::open_memory().unwrap(), keystore: axel_identity::Keystore::open_at(temp.join("host-keys.json"), false).unwrap(), rex: None };
+        let host_kp = host.owner().unwrap();
+        let consent = Some(axel_identity::consent_to_link(&host_kp, &home.public()));
+        let link = axel_store::DeviceRecord { op: axel_store::DeviceOp::Link, device: host_kp.public().to_base58(), label: "linux".into(), route: Some(axel_store::PairingRoute::Ssh), consent };
+        host.store.post(&EnvelopeBuilder::new(axel_store::kind::OWNER_DEVICE, serde_json::to_string(&link).unwrap()).sign(home).unwrap()).unwrap();
+        let profile = axel_store::ProfileWire {
+            profile_id: "p-reviewer".into(),
+            owner: profile_owner.public().to_base58(),
+            name: "reviewer".into(),
+            harness: axel_store::Harness::Claude,
+            model: None,
+            effort: None,
+            skills: vec![],
+            prompt: None,
+            color: None,
+            runtime_mode: axel_store::RuntimeMode::Autopilot,
+            archived: false,
+            merged_into: None,
+        };
+        let env = EnvelopeBuilder::new(axel_store::kind::AGENT_PROFILE, serde_json::to_string(&profile).unwrap()).sign(profile_owner).unwrap();
+        // A stranger's profile is refused by the store; a test of the job check
+        // then needs it in place anyway, as a host that ran its jobs would have it.
+        if host.store.append(&env).unwrap().rejected_reason.is_some() {
+            host.store.insert_agent(&axel_store::NewAgent {
+                pubkey: axel_identity::Keypair::generate().public().to_base58(),
+                name: "reviewer".into(),
+                profile_id: Some("p-reviewer".into()),
+                auth_tag: Some(axel_identity::attest(profile_owner, &axel_identity::Keypair::generate().public(), "").unwrap().to_tag()),
+                ..Default::default()
+            }).unwrap();
+        }
+        let thread = host.store.create_thread(home, "t", "intent", None).unwrap();
+        (host, thread.id, "p-reviewer".into())
+    }
+
+    fn instance_job(thread_id: &str, profile_id: &str) -> Job {
+        Job {
+            thread_id: thread_id.into(),
+            title: "t".into(),
+            agent: JobAgent { pubkey: "pk-home-instance".into(), name: "reviewer".into(), harness: axel_store::Harness::Claude, model: None, effort: None, skills: vec![], prompt: None, color: None, auth_tag: None, profile_id: Some(profile_id.into()) },
+            job_key: String::new(),
+            delegation: vec![],
+            prompt: "review".into(),
+            from: None,
+            workspace: None,
+            attachments: vec![],
+            resume: None,
+            reach: axel_store::Reach::default(),
+            budget: axel_store::Budget::default(),
+            peers: vec![],
+            instance: true,
+        }
+    }
+
+    #[test]
+    fn a_job_from_another_device_of_ours_runs_this_devices_own_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = axel_identity::Keypair::generate();
+        let (host, thread_id, profile_id) = linked_host(temp.path(), &home, &home);
+        let first = job_instance(&host, &instance_job(&thread_id, &profile_id)).unwrap();
+        assert_ne!(first, "pk-home-instance", "it signs as itself, not as the home's instance");
+        let agent = host.store.agent_by_pubkey(&first).unwrap().unwrap();
+        assert_eq!((agent.profile_id.as_str(), agent.device.as_deref()), ("p-reviewer", None));
+        assert!(host.keystore.agent(&first.parse().unwrap()).unwrap().is_some(), "its key is here");
+        assert!(host.store.unannounced_instances().unwrap().is_empty(), "and it was announced");
+        let again = job_instance(&host, &instance_job(&thread_id, &profile_id)).unwrap();
+        assert_eq!(again, first, "the next job reuses it");
+    }
+
+    #[test]
+    fn a_job_for_another_owners_profile_needs_a_delegation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, stranger) = (axel_identity::Keypair::generate(), axel_identity::Keypair::generate());
+        let (host, thread_id, profile_id) = linked_host(temp.path(), &home, &stranger);
+        let refused = job_instance(&host, &instance_job(&thread_id, &profile_id)).unwrap_err();
+        assert!(format!("{refused:#}").contains("another owner"), "{refused:#}");
+        let missing = job_instance(&host, &instance_job(&thread_id, "p-unknown")).unwrap_err();
+        assert!(format!("{missing:#}").contains("hasn't arrived"), "{missing:#}");
+    }
+
     #[test]
     fn a_job_sets_effort_for_an_agent_the_host_already_knows() {
         use axel_store::{Effort, Harness};
@@ -1779,6 +2277,7 @@ mod tests {
                 reach: axel_store::Reach::default(),
                 budget: axel_store::Budget::default(),
                 peers: vec![JobAgent::of(&local_orion)],
+                instance: false,
             })
             .unwrap(),
         )
@@ -1818,6 +2317,7 @@ mod tests {
                 reach: axel_store::Reach::default(),
                 budget: axel_store::Budget::default(),
                 peers: vec![],
+                instance: false,
             })
             .unwrap(),
         )

@@ -26,7 +26,7 @@ macro_rules! str_enum {
             }
         }
 
-        impl FromStr for $name {
+        impl std::str::FromStr for $name {
             type Err = Error;
             fn from_str(s: &str) -> Result<Self, Error> {
                 match s {
@@ -43,6 +43,7 @@ macro_rules! str_enum {
         }
     };
 }
+pub(crate) use str_enum;
 
 /// Lenient serde helpers for enum fields read back from the log: text this
 /// build does not know maps to the enum's default (or `None`) instead of
@@ -490,6 +491,186 @@ pub struct Agent {
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub archived_at: Option<i64>,
+    /// The profile this agent is an instance of (RFD 0004).  Name, harness,
+    /// model, effort, skills, prompt, colour and mode above are the profile's.
+    #[serde(default)]
+    pub profile_id: String,
+    /// The owner the profile belongs to, when known (base58).
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// The device that runs this instance, when it is another machine;
+    /// `None` is this machine.
+    #[serde(default)]
+    pub device: Option<String>,
+}
+
+/// What an agent is, the same on every device of its owner (RFD 0004).
+/// It has no key; its instances do.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub profile_id: String,
+    pub owner: Option<String>,
+    pub name: String,
+    pub harness: Harness,
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub skills: Vec<String>,
+    pub prompt: Option<String>,
+    pub color: Option<AgentColor>,
+    pub runtime_mode: RuntimeMode,
+    pub created_at: i64,
+    /// `created_at` of the kind-122 envelope that set it, or of the last
+    /// local edit not yet signed.
+    pub updated_at: i64,
+    /// The kind-122 envelope that set it; `None` while a local edit waits to
+    /// be signed and published.
+    pub updated_id: Option<String>,
+    pub archived_at: Option<i64>,
+    /// The profile this one was merged into (RFD 0004 phase 7).  A merged
+    /// profile is archived, and its instances are the other one's.
+    pub merged_into: Option<String>,
+}
+
+impl AgentProfile {
+    /// Whether `self` and `other` define the same agent: what it runs and
+    /// how it behaves.  Colour is left out: it is picked at random when a
+    /// profile is made, so two homes' `reviewer`s rarely share one.
+    pub fn same_definition(&self, other: &AgentProfile) -> bool {
+        let sorted = |skills: &[String]| {
+            let mut skills = skills.to_vec();
+            skills.sort();
+            skills
+        };
+        self.harness == other.harness
+            && self.model == other.model
+            && self.effort == other.effort
+            && sorted(&self.skills) == sorted(&other.skills)
+            && self.prompt == other.prompt
+            && self.runtime_mode == other.runtime_mode
+    }
+}
+
+str_enum! {
+    /// The reach rule a team sets for its members (RFD 0005, "Policy
+    /// template").  `none` sets no rule: each member's own policy alone applies.
+    #[derive(Default)]
+    TeamReach {
+        #[default]
+        None => "none",
+        /// A member may reach the other members of the team.
+        Team => "team",
+        /// The lead may reach every member; a member may reach the lead alone.
+        Lead => "lead",
+    }
+}
+
+/// One member of a team: a profile, not an instance, so a team doesn't care
+/// which machine a member runs on.  The role is free text Axel shows and
+/// writes into the roster; it never acts on it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub profile_id: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+/// A named set of the owner's agent profiles, with skills and a reach rule
+/// they share (RFD 0005).  The same on every device of its owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Team {
+    pub team_id: String,
+    pub owner: String,
+    pub name: String,
+    /// In the order they were added.
+    pub members: Vec<TeamMember>,
+    /// Skill sources in the `skills:` syntax of `AXEL.md`, installed for
+    /// every member when it runs.
+    pub skills: Vec<String>,
+    pub reach: TeamReach,
+    /// The lead's profile id; always one of `members`.
+    pub lead: Option<String>,
+    pub created_at: i64,
+    /// `created_at` of the kind-123 envelope that set it, or of the last
+    /// local edit not yet signed.
+    pub updated_at: i64,
+    /// The kind-123 envelope that set it; `None` while a local edit waits to
+    /// be signed and published.
+    pub updated_id: Option<String>,
+    pub archived_at: Option<i64>,
+}
+
+impl Team {
+    /// Whether `profile_id` is one of the members.
+    pub fn has_member(&self, profile_id: &str) -> bool {
+        self.members.iter().any(|m| m.profile_id == profile_id)
+    }
+}
+
+/// A team to create, for [`crate::Store::create_team`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewTeam {
+    /// The principal that owns it (the owner key, not a device).
+    pub owner: String,
+    pub name: String,
+    pub members: Vec<TeamMember>,
+    pub skills: Vec<String>,
+    pub reach: TeamReach,
+    /// Added as a member when it isn't one.
+    pub lead: Option<String>,
+}
+
+/// A change to a team, for [`crate::Store::edit_team`].  Removals apply
+/// before additions; adding a member already there changes its role.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TeamEdit {
+    pub add: Vec<TeamMember>,
+    /// Profile ids.
+    pub remove: Vec<String>,
+    /// A new lead, added as a member when it isn't one.
+    pub lead: Option<String>,
+    /// Replaces the skill sources.
+    pub skills: Option<Vec<String>>,
+    pub reach: Option<TeamReach>,
+}
+
+str_enum! {
+    /// How a device link proved that the far end is the machine we meant
+    /// (RFD 0004, "Pairing over a trusted route").
+    PairingRoute {
+        /// Rex's built-in Tailscale: the node key, and `server.whoami`.
+        RexTailscale => "rex_tailscale",
+        /// The SSH host key, checked against `known_hosts` (`BatchMode=yes`).
+        Ssh => "ssh",
+        /// NetBird or plain WireGuard plus a confirmed code.
+        Wireguard => "wireguard",
+        /// A code derived from both keys, compared by the owner on both machines.
+        Confirm => "confirm",
+    }
+}
+
+str_enum! {
+    /// What a kind-120 envelope does.
+    DeviceOp {
+        /// The signer adopts `device` as one of its machines.
+        Link => "link",
+        /// The signer withdraws `device`: it authorizes nothing signed after this.
+        Revoke => "revoke",
+        /// The signer names its own machine (`device` is the signer).
+        Label => "label",
+    }
+}
+
+/// A machine known to this replica: linked to an owner, or an owner's own
+/// machine label (`owner: None`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub pubkey: String,
+    pub owner: Option<String>,
+    pub label: String,
+    /// How the link was proved; `None` for an owner's own label.
+    pub route: Option<PairingRoute>,
+    pub linked_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 /// Input for [`crate::Store::insert_agent`].
@@ -506,6 +687,11 @@ pub struct NewAgent {
     pub color: Option<AgentColor>,
     pub runtime_mode: RuntimeMode,
     pub auth_tag: Option<Vec<String>>,
+    /// The profile to instantiate; `None` makes a new profile from the
+    /// fields above.  An existing profile keeps its own fields.
+    pub profile_id: Option<String>,
+    /// The machine that runs it, when not this one.
+    pub device: Option<String>,
 }
 
 /// A thread: an intent with a title, projected from its event log.

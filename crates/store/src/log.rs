@@ -9,12 +9,13 @@
 //! the log and are re-evaluated on every replay, so a later participant-add
 //! revives them without a manual rebuild.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use axel_identity::{AuthTag, Delegation, PublicKey, verify_attestation};
 use axel_inbox::Envelope;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::owner::Principals;
 use crate::schema::PROJECTION_TABLES;
 use crate::wire::{self, ParticipantAction, ProjectAction, kind, tag};
 use crate::{
@@ -56,6 +57,35 @@ fn is_scoped(env: &Envelope) -> bool {
 }
 
 const DELEGATED_WITHOUT_THREAD: &str = "a delegated envelope must be on a thread";
+
+/// The most envelopes one [`Store::append_all`] takes.  Sync moves 500 per
+/// batch; a caller past this many is holding a transaction open too long.
+pub(crate) const APPEND_ALL_ENVELOPES_MAX: usize = 10_000;
+
+/// The thread replays appends owe, paid once by [`Replays::settle`].
+#[derive(Debug, Default)]
+struct Replays {
+    /// Threads that took a new envelope.
+    threads: BTreeSet<String>,
+    /// Whether who may sign changed, so every thread is owed one.
+    all: bool,
+}
+
+impl Replays {
+    fn settle(self, conn: &Connection) -> Result<(), Error> {
+        let threads: Vec<String> = if self.all {
+            let mut st = conn.prepare_cached("SELECT DISTINCT thread_id FROM events WHERE thread_id IS NOT NULL")?;
+            let rows = st.query_map([], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        } else {
+            self.threads.into_iter().collect()
+        };
+        for thread_id in &threads {
+            replay_thread(conn, thread_id, None)?;
+        }
+        Ok(())
+    }
+}
 const NO_THREAD_TAG: &str = "thread-scoped envelope without a [\"t\", thread_id] tag";
 
 impl Store {
@@ -65,11 +95,66 @@ impl Store {
     /// that fail authorization are stored with `rejected_reason` and revisited
     /// on later replays.
     pub fn append(&self, env: &Envelope) -> Result<Appended, Error> {
-        env.verify()?;
+        let mut appended = self.append_all(std::slice::from_ref(env), |_| Ok(true))?;
+        assert_eq!(appended.len(), 1, "one outcome per envelope");
+        Ok(appended.pop().flatten().expect("an envelope every caller keeps is appended"))
+    }
+
+    /// [`Store::append`] for many envelopes, in one transaction and in order.
+    /// Each thread they touch is replayed once at the end, and every thread
+    /// at most once when a link or an announcement among them changed who may
+    /// sign: one at a time, the initial sync of a large home replays every
+    /// thread once per announced agent.
+    ///
+    /// `keep` is asked about each envelope right before it is stored, so it
+    /// sees the device links stored before it (sync keeps owner records only
+    /// from keys that speak for this machine's owner).  An envelope it turns
+    /// away is not stored, and its outcome is `None`.  Outcomes are read once
+    /// the replays are done.  Any error stores none of them.
+    pub fn append_all(
+        &self,
+        envs: &[Envelope],
+        mut keep: impl FnMut(&Envelope) -> Result<bool, Error>,
+    ) -> Result<Vec<Option<Appended>>, Error> {
+        if envs.len() > APPEND_ALL_ENVELOPES_MAX {
+            return Err(Error::Invalid(format!(
+                "{} envelopes in one append, past the {APPEND_ALL_ENVELOPES_MAX} allowed",
+                envs.len()
+            )));
+        }
         let tx = self.conn.unchecked_transaction()?;
-        let appended = append_in(&tx, env)?;
+        let mut owed = Replays::default();
+        let mut stored: Vec<Option<Stored>> = Vec::with_capacity(envs.len());
+        for env in envs {
+            if !keep(env)? {
+                stored.push(None);
+                continue;
+            }
+            env.verify()?;
+            stored.push(Some(append_in(&tx, env, &mut owed)?));
+        }
+        owed.settle(&tx)?;
+        let mut outcomes = Vec::with_capacity(envs.len());
+        for (env, stored) in envs.iter().zip(stored) {
+            let outcome = match stored {
+                None => None,
+                Some(Stored::Dropped(reason)) => Some(Appended { inserted: false, projected: false, rejected_reason: Some(reason) }),
+                Some(Stored::Already) => {
+                    let (projected, rejected_reason) = event_state(&tx, &env.id)?;
+                    Some(Appended { inserted: false, projected, rejected_reason })
+                }
+                Some(Stored::New) => {
+                    let (projected, rejected_reason) = event_state(&tx, &env.id)?;
+                    // The replays above settle every new event one way or the other.
+                    assert!(projected != rejected_reason.is_some(), "event {} is exactly one of projected or rejected", env.id);
+                    Some(Appended { inserted: true, projected, rejected_reason })
+                }
+            };
+            outcomes.push(outcome);
+        }
         tx.commit()?;
-        Ok(appended)
+        assert_eq!(outcomes.len(), envs.len(), "one outcome per envelope, in order");
+        Ok(outcomes)
     }
 
     /// [`Store::append`] for a message built elsewhere, failing loudly when it
@@ -143,6 +228,10 @@ impl Store {
             "UPDATE events SET applied_at = NULL, rejected_reason = NULL",
             [],
         )?;
+        // Device links are only ever kind-120 envelopes: they replay from
+        // scratch too.  Profiles and teams also hold unsigned local edits, so
+        // they are revalidated below instead.
+        tx.execute("DELETE FROM devices", [])?;
 
         let plain: Vec<Envelope> = {
             let mut st = tx.prepare(&format!(
@@ -157,10 +246,23 @@ impl Store {
             } else if has_delegation(env) {
                 // These have no thread tag, and a delegation is only valid on one.
                 mark_rejected(&tx, &env.id, DELEGATED_WITHOUT_THREAD)?;
+            } else if kind::is_owner_record(env.kind) {
+                // Settled here without the thread replay `owner::project`
+                // would do: every thread is replayed below anyway.
+                match crate::owner::apply_only(&tx, env)? {
+                    Ok(()) => {
+                        mark_applied(&tx, &env.id)?;
+                        // As `owner::project` does, so a rebuild settles
+                        // every record the way arriving one by one did.
+                        crate::owner::revive(&tx)?;
+                    }
+                    Err(reason) => mark_rejected(&tx, &env.id, &reason)?,
+                }
             } else {
                 project_plain(&tx, env)?;
             }
         }
+        crate::owner::revalidate(&tx)?;
 
         let threads: Vec<String> = {
             let mut st =
@@ -171,6 +273,7 @@ impl Store {
         for thread_id in &threads {
             replay_thread(&tx, thread_id, Some(&offsets))?;
         }
+        crate::schedule::rebuild_runs(&tx)?;
         // Every event was either projected or rejected by the passes above.
         debug_assert_eq!(
             tx.query_row(
@@ -185,12 +288,31 @@ impl Store {
     }
 }
 
-fn append_in(conn: &Connection, env: &Envelope) -> Result<Appended, Error> {
-    // Only `Store::append` calls this, after checking id and signature.
+/// What [`append_in`] did with an envelope.
+#[derive(Debug)]
+enum Stored {
+    /// New to the log.
+    New,
+    /// Already in the log; nothing changed.
+    Already,
+    /// Not stored, for this reason: a second run of a schedule.
+    Dropped(String),
+}
+
+/// Store one verified envelope and settle what it can settle now: owner
+/// records and plain envelopes are projected, a thread envelope's replay is
+/// added to `owed`.
+fn append_in(conn: &Connection, env: &Envelope, owed: &mut Replays) -> Result<Stored, Error> {
+    // Only `Store::append_all` calls this, after checking id and signature.
     debug_assert!(env.verify().is_ok(), "an envelope is verified before it is stored");
     // Refused before storing, like a bad signature: a `created_at` past
     // `i64::MAX` would be stored negative and replay before everything.
     let created_at = sql_integer(env.created_at, "envelope created_at")?;
+    // A second run with a number another note already took (two devices
+    // firing one schedule) is dropped, not stored: sync never spreads it.
+    if let Some(reason) = crate::schedule::duplicate_run(conn, env)? {
+        return Ok(Stored::Dropped(reason));
+    }
     let tags_json = serde_json::to_string(&env.tags)?;
     let thread_id = thread_id_of(env);
     let session_id = env.first_tag(tag::SESSION);
@@ -211,37 +333,26 @@ fn append_in(conn: &Connection, env: &Envelope) -> Result<Appended, Error> {
         ],
     )?;
     if inserted == 0 {
-        let (projected, rejected_reason) = event_state(conn, &env.id)?;
-        return Ok(Appended {
-            inserted: false,
-            projected,
-            rejected_reason,
-        });
+        return Ok(Stored::Already);
     }
+    crate::schedule::record_run(conn, env)?;
     if is_scoped(env) {
         match &thread_id {
-            Some(t) => replay_thread(conn, t, None)?,
+            Some(t) => {
+                owed.threads.insert(t.clone());
+            }
             None => mark_rejected(conn, &env.id, NO_THREAD_TAG)?,
         }
     } else if has_delegation(env) && thread_id.is_none() {
         mark_rejected(conn, &env.id, DELEGATED_WITHOUT_THREAD)?;
     } else if let Some(r) = thread_id.as_deref().and_then(|t| delegation_problem(env, t)) {
         mark_rejected(conn, &env.id, &r)?;
+    } else if kind::is_owner_record(env.kind) {
+        owed.all |= crate::owner::project(conn, env)?;
     } else {
         project_plain(conn, env)?;
     }
-    let (projected, rejected_reason) = event_state(conn, &env.id)?;
-    // Each branch above settles the new event one way or the other.
-    assert!(
-        projected != rejected_reason.is_some(),
-        "event {} is exactly one of projected or rejected",
-        env.id
-    );
-    Ok(Appended {
-        inserted: true,
-        projected,
-        rejected_reason,
-    })
+    Ok(Stored::New)
 }
 
 fn event_state(conn: &Connection, id: &str) -> Result<(bool, Option<String>), Error> {
@@ -252,7 +363,7 @@ fn event_state(conn: &Connection, id: &str) -> Result<(bool, Option<String>), Er
     )?)
 }
 
-fn mark_applied(conn: &Connection, id: &str) -> Result<(), Error> {
+pub(crate) fn mark_applied(conn: &Connection, id: &str) -> Result<(), Error> {
     let updated = conn.execute(
         "UPDATE events SET applied_at = ?2, rejected_reason = NULL WHERE id = ?1",
         params![id, now()],
@@ -261,7 +372,7 @@ fn mark_applied(conn: &Connection, id: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn mark_rejected(conn: &Connection, id: &str, reason: &str) -> Result<(), Error> {
+pub(crate) fn mark_rejected(conn: &Connection, id: &str, reason: &str) -> Result<(), Error> {
     let updated = conn.execute(
         "UPDATE events SET applied_at = NULL, rejected_reason = ?2 WHERE id = ?1",
         params![id, reason],
@@ -426,13 +537,14 @@ fn authorize(
     env: &Envelope,
     participants: &BTreeMap<String, ParticipantRow>,
     own_agents: &HashMap<String, Option<AuthTag>>,
+    principals: &Principals,
 ) -> Option<String> {
     let who = author(env);
-    if participants.contains_key(who) {
+    if participants.contains_key(principals.resolve(who, env.created_at)) {
         return None;
     }
     if let Some(owner) = attested_owner(env, own_agents)
-        && participants.contains_key(&owner)
+        && participants.contains_key(principals.resolve(&owner, env.created_at))
     {
         return None;
     }
@@ -474,14 +586,15 @@ pub(crate) fn replay_thread(
     };
     clear_thread(conn, thread_id)?;
     let own_agents = load_own_agents(conn)?;
+    let principals = Principals::load(conn)?;
 
-    let Some(roster) = participant_roster(&events, thread_id) else {
+    let Some(roster) = participant_roster(&events, thread_id, &principals) else {
         for e in &events {
             mark_rejected(conn, &e.id, "thread root (kind 100) not received yet")?;
         }
         return Ok(());
     };
-    authorize_and_apply(conn, &events, thread_id, &roster, &own_agents)?;
+    authorize_and_apply(conn, &events, thread_id, &roster, &own_agents, &principals)?;
     restore_local_session_state(conn, saved_offsets)
 }
 
@@ -495,7 +608,10 @@ struct Roster<'a> {
 
 /// The thread's roster after `events` (in replay order), or `None` while the
 /// thread root has not been received.
-fn participant_roster<'a>(events: &'a [Envelope], thread_id: &str) -> Option<Roster<'a>> {
+///
+/// Keys are principals: a thread a device created is its owner's, and any
+/// device of that owner may change the roster.
+fn participant_roster<'a>(events: &'a [Envelope], thread_id: &str, principals: &Principals) -> Option<Roster<'a>> {
     let mut roster = Roster {
         participants: BTreeMap::new(),
         valid_changes: HashSet::new(),
@@ -504,32 +620,34 @@ fn participant_roster<'a>(events: &'a [Envelope], thread_id: &str) -> Option<Ros
     for e in events {
         if e.kind == kind::THREAD_CREATE && e.id == thread_id {
             roster.participants.insert(
-                e.from.clone(),
+                principals.resolve(&e.from, e.created_at).to_string(),
                 ParticipantRow {
                     role: ParticipantRole::Owner,
                 },
             );
             root_seen = true;
         } else if e.kind == kind::THREAD_PARTICIPANT {
-            apply_participant_change(&mut roster, e);
+            apply_participant_change(&mut roster, e, principals);
         }
     }
     root_seen.then_some(roster)
 }
 
 /// Mirror one participant change into `roster` if its signer may make it.
-fn apply_participant_change<'a>(roster: &mut Roster<'a>, e: &'a Envelope) {
+fn apply_participant_change<'a>(roster: &mut Roster<'a>, e: &'a Envelope, principals: &Principals) {
     let Some(target) = e.first_tag(tag::MENTION) else {
         return;
     };
     let Ok(op) = serde_json::from_str::<wire::ParticipantOp>(&e.content) else {
         return;
     };
+    let signer = principals.resolve(&e.from, e.created_at);
+    let target = principals.resolve(target, e.created_at);
     let signer_is_owner = roster
         .participants
-        .get(&e.from)
+        .get(signer)
         .is_some_and(|p| p.role == ParticipantRole::Owner);
-    let self_remove = op.op == ParticipantAction::Remove && target == e.from;
+    let self_remove = op.op == ParticipantAction::Remove && target == signer;
     if !(signer_is_owner || self_remove) {
         return;
     }
@@ -557,6 +675,7 @@ fn authorize_and_apply(
     thread_id: &str,
     roster: &Roster<'_>,
     own_agents: &HashMap<String, Option<AuthTag>>,
+    principals: &Principals,
 ) -> Result<(), Error> {
     for e in events {
         let reason = if e.kind == kind::THREAD_CREATE {
@@ -566,7 +685,7 @@ fn authorize_and_apply(
                 .then(|| "participant change not signed by a current owner".to_string())
         } else {
             delegation_problem(e, thread_id)
-                .or_else(|| authorize(e, &roster.participants, own_agents))
+                .or_else(|| authorize(e, &roster.participants, own_agents, principals))
         };
         match reason {
             Some(r) => mark_rejected(conn, &e.id, &r)?,

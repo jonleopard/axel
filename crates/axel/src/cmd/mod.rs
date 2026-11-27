@@ -3,6 +3,7 @@
 mod agent;
 mod claude_profile;
 mod convert;
+mod device;
 mod diff;
 pub(crate) mod display;
 mod effort;
@@ -19,11 +20,13 @@ mod process_control;
 mod reconcile;
 mod resume;
 mod rex_link;
+mod schedule;
 mod session;
 mod setup;
 mod skills;
 mod links;
 mod status;
+mod team;
 mod text;
 mod thread;
 mod ui;
@@ -86,7 +89,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         None => {
             // The first time, with no agent yet: walk through setup, then open.
             if setup::interactive() && Ctx::open().map(|c| setup::needed(&c)).unwrap_or(false) {
-                return match setup::run()? {
+                return match setup::run(setup::SetupMode::Quick)? {
                     setup::Next::Open => ui::open_launcher(),
                     setup::Next::Quit => Ok(()),
                 };
@@ -95,7 +98,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         }
         Some(Command::ClaudeAcp) => axel_acp::claude::serve_stdio(),
         Some(Command::CodexAcp) => axel_acp::codex::serve_stdio(),
-        Some(Command::Setup) => match setup::run()? {
+        Some(Command::Setup { custom, yes }) => match setup::run(match (custom, yes) {
+            (true, _) => setup::SetupMode::Custom,
+            (_, true) => setup::SetupMode::Unattended,
+            _ => setup::SetupMode::Quick,
+        })? {
             setup::Next::Open => ui::open_launcher(),
             setup::Next::Quit => Ok(()),
         },
@@ -103,6 +110,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Session { command }) => session::run(command),
         Some(Command::Log { session, follow }) => log::run(&session, follow),
         Some(Command::Agent { command }) => agent::run(command),
+        Some(Command::Team { command }) => team::run(command),
         Some(Command::Skills { command }) => skills::run(command),
         Some(Command::Thread { command }) => thread::run(command),
         Some(Command::Hook { harness, guard_only }) => hook::run(harness, guard_only),
@@ -134,11 +142,23 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             crate::cli::HostCommand::Rm { label } => host::remove(&label),
             crate::cli::HostCommand::Rpc => host::rpc_serve(),
         },
+        Some(Command::Device { command }) => match command {
+            crate::cli::DeviceCommand::Link { label, ssh, route, code, install } => {
+                device::link(&label, ssh.as_deref(), route, code.as_deref(), install)
+            }
+            crate::cli::DeviceCommand::Ls => device::list(),
+            crate::cli::DeviceCommand::Revoke { label } => device::revoke(&label),
+            crate::cli::DeviceCommand::Code { owner } => device::code(&owner),
+            crate::cli::DeviceCommand::Merge { name, keep, rename } => {
+                device::merge(name.as_deref(), keep.as_deref(), rename.as_deref())
+            }
+        },
         Some(Command::Panes { choice }) => display::panes_cmd(choice),
         Some(Command::Web { command }) => match command {
             crate::cli::WebCommand::Pane { thread, view } => web::pane(&thread, view),
             crate::cli::WebCommand::Serve { thread, view } => web::serve(&thread, view),
         },
         Some(Command::Sync { host, follow }) => host::sync_cmd(host.as_deref(), follow),
+        Some(Command::Schedule { command }) => schedule::run(command),
     }
 }

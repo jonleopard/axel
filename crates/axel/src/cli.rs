@@ -44,6 +44,12 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Teams: named sets of agents with skills and a reach rule they share.
+    #[command(visible_alias = "teams")]
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
     /// Skills this project can use: directories, and remote skills pinned in AXEL.lock.
     #[command(visible_alias = "skill")]
     Skills {
@@ -101,7 +107,14 @@ pub enum Command {
         json: bool,
     },
     /// Get this machine ready and create an agent (runs by itself the first time).
-    Setup,
+    Setup {
+        /// Choose everything: harness, skills, colour, mode, and more agents.
+        #[arg(long)]
+        custom: bool,
+        /// Ask nothing: the defaults and the first free name (for scripts).
+        #[arg(long, conflicts_with = "custom")]
+        yes: bool,
+    },
     /// The built-in Claude Code ACP agent (what managed Claude sessions run).
     #[command(name = "claude-acp", hide = true)]
     ClaudeAcp,
@@ -142,6 +155,12 @@ pub enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// Your other machines: link one so it acts for you, list, revoke.
+    #[command(visible_alias = "devices")]
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     /// How thread views are drawn: `terminal` (text, the default) or `web`
     /// (experimental: a web page drawn by Ladybird, where it is installed).
     Panes {
@@ -162,6 +181,120 @@ pub enum Command {
         #[arg(long)]
         follow: bool,
     },
+    /// Scheduled work: messages that arrive in an agent's inbox at a set time.
+    #[command(visible_alias = "schedules")]
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleCommand {
+    /// Arm a schedule: AGENT gets PROMPT on a thread at a set time.
+    Add(Box<ScheduleAdd>),
+    /// List schedules, with their next run.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Cancelled and finished ones too.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Cancel a schedule (id or unique prefix).
+    #[command(visible_alias = "cancel")]
+    Rm { schedule: String },
+    /// Send every run that is due (run it from cron every minute; running it twice sends nothing new).
+    Tick,
+}
+
+/// `axel schedule add`'s arguments: one place (`--thread` or `--new`) and one
+/// time (`--at`, `--every` or `--daily`).
+#[derive(clap::Args, Debug)]
+#[command(group = clap::ArgGroup::new("place").required(true).args(["thread", "new"]))]
+#[command(group = clap::ArgGroup::new("when").required(true).args(["at", "every", "daily"]))]
+pub struct ScheduleAdd {
+    /// The recipient, `@name` or `name`.
+    pub agent: String,
+    /// Every run on this thread (id or unique prefix).
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// A new thread with this title for every run.
+    #[arg(long = "new", value_name = "TITLE")]
+    pub new: Option<String>,
+    /// A project for the new thread (repeatable); the current directory when none.
+    #[arg(long = "project", value_name = "DIR", requires = "new")]
+    pub projects: Vec<std::path::PathBuf>,
+    /// One run at this RFC 3339 time (`2026-11-26T09:00:00+01:00`).
+    #[arg(long, value_name = "RFC3339")]
+    pub at: Option<String>,
+    /// A run every DURATION (`90s`, `15m`, `2h`, `7d`; at least a minute).
+    #[arg(long, value_name = "DURATION")]
+    pub every: Option<String>,
+    /// A run every day at HH:MM.
+    #[arg(long, value_name = "HH:MM")]
+    pub daily: Option<String>,
+    /// The UTC offset of --daily (`+01:00`); this machine's current offset when omitted.
+    #[arg(long, value_name = "OFFSET", requires = "daily", allow_hyphen_values = true)]
+    pub tz: Option<String>,
+    /// Most runs it sends (default 1000).
+    #[arg(long, value_name = "N")]
+    pub runs_max: Option<u32>,
+    /// No run after this RFC 3339 time.
+    #[arg(long, value_name = "RFC3339")]
+    pub until: Option<String>,
+    /// What the agent is asked, every run.
+    #[arg(required = true)]
+    pub prompt: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DeviceCommand {
+    /// Make another machine one of yours: install Axel there over SSH, check
+    /// it is the machine you meant, sign the link, and sync everything.
+    Link {
+        /// Name for the machine (also its host label).
+        label: String,
+        /// SSH destination; defaults to the label.
+        #[arg(long)]
+        ssh: Option<String>,
+        /// How to prove the far end is that machine: `ssh` (its host key in
+        /// known_hosts), `confirm` or `wireguard` (compare a code).
+        #[arg(long, default_value = "ssh", value_parser = parse_route)]
+        route: axel_store::PairingRoute,
+        /// The code `axel device code` printed on the other machine.
+        #[arg(long)]
+        code: Option<String>,
+        /// Install what's missing there (Node, Claude Code) with Homebrew and npm.
+        #[arg(long)]
+        install: bool,
+    },
+    /// List the machines this one knows.
+    #[command(alias = "list")]
+    Ls,
+    /// Withdraw a machine: nothing it signs from now on speaks for you.
+    Revoke { label: String },
+    /// Print the code to compare when OWNER links this machine.
+    Code { owner: String },
+    /// Settle names two linked machines both gave an agent: identical agents
+    /// merge into one; for the others, keep one or rename one.
+    Merge {
+        /// The name to settle; every shared name when omitted.
+        name: Option<String>,
+        /// Keep this agent profile (id or unique prefix) and merge the others
+        /// named NAME into it: their instances become its instances.
+        #[arg(long, value_name = "PROFILE", requires = "name", conflicts_with = "rename")]
+        keep: Option<String>,
+        /// Give this agent profile (id or unique prefix) another name.
+        #[arg(long, num_args = 2, value_names = ["PROFILE", "NEW_NAME"], requires = "name")]
+        rename: Option<Vec<String>>,
+    },
+}
+
+fn parse_route(text: &str) -> Result<axel_store::PairingRoute, String> {
+    text.replace('-', "_").parse().map_err(|_| {
+        let names: Vec<&str> = axel_store::PairingRoute::ALL.iter().map(|r| r.as_str()).collect();
+        format!("one of {}", names.join(", "))
+    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,7 +441,8 @@ pub struct PolicyArgs {
     /// Take these agents off the list.
     #[arg(long, value_delimiter = ',', value_name = "AGENT")]
     pub disallow: Vec<String>,
-    /// Replace the list: nobody, or any agent.
+    /// Replace the list: nobody, any agent, the other members of its teams,
+    /// or as its teams' leads allow (`--allow` names still come on top).
     #[arg(long, value_enum)]
     pub reach: Option<ReachArg>,
     /// Daily spend cap in estimated USD, or `unlimited` (the default).
@@ -323,6 +457,78 @@ pub struct PolicyArgs {
 pub enum ReachArg {
     Nobody,
     Anyone,
+    /// The other members of its teams.
+    Team,
+    /// Its teams' leads if it is a member; every member of a team it leads.
+    Lead,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TeamCommand {
+    /// Create a team of agents.
+    #[command(aliases = ["create", "add"])]
+    New {
+        name: String,
+        /// The agent that leads it (joins as a member).
+        #[arg(long, value_name = "AGENT")]
+        lead: Option<String>,
+        /// A member, with an optional role shown in the roster (repeatable).
+        #[arg(long = "member", value_name = "AGENT[:ROLE]")]
+        members: Vec<String>,
+        /// A skill source in AXEL.md's `skills:` syntax, installed for every member (repeatable).
+        #[arg(long = "skills", value_name = "SOURCE")]
+        skills: Vec<String>,
+        /// Who members may reach: each other, through the lead, or no team rule.
+        #[arg(long, value_enum, default_value_t = TeamReachArg::None)]
+        reach: TeamReachArg,
+    },
+    /// Change a team's members, lead, skills or reach.
+    Edit {
+        name: String,
+        /// Add a member, or change its role (repeatable).
+        #[arg(long = "add", value_name = "AGENT[:ROLE]")]
+        add: Vec<String>,
+        /// Take a member out (repeatable).
+        #[arg(long = "remove", value_name = "AGENT")]
+        remove: Vec<String>,
+        /// Make this agent the lead (joins as a member).
+        #[arg(long, value_name = "AGENT")]
+        lead: Option<String>,
+        /// Replace the skill sources (repeatable).
+        #[arg(long = "skills", value_name = "SOURCE")]
+        skills: Vec<String>,
+        #[arg(long, value_enum)]
+        reach: Option<TeamReachArg>,
+    },
+    /// Show one team: members, roles, lead, skills and reach.
+    #[command(alias = "info")]
+    Show { name: String },
+    /// List teams.
+    #[command(alias = "list")]
+    Ls,
+    /// Archive a team: its reach rule and skills stop applying.
+    #[command(aliases = ["archive", "delete"])]
+    Rm { name: String },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum TeamReachArg {
+    /// Members may reach each other.
+    Team,
+    /// The lead may reach every member; members may reach the lead alone.
+    Lead,
+    /// No team rule: each member's own reach applies.
+    None,
+}
+
+impl From<TeamReachArg> for axel_store::TeamReach {
+    fn from(r: TeamReachArg) -> Self {
+        match r {
+            TeamReachArg::Team => axel_store::TeamReach::Team,
+            TeamReachArg::Lead => axel_store::TeamReach::Lead,
+            TeamReachArg::None => axel_store::TeamReach::None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -638,6 +844,31 @@ mod alias_tests {
     }
 
     #[test]
+    fn a_schedule_names_one_place_and_one_time() {
+        let Command::Schedule { command: ScheduleCommand::Add(add) } =
+            parses(&["schedule", "add", "@reviewer", "--thread", "01JD", "--daily", "09:00", "--tz", "-05:00", "review", "merges"])
+        else {
+            panic!()
+        };
+        assert_eq!((add.agent.as_str(), add.thread.as_deref(), add.daily.as_deref(), add.tz.as_deref()), ("@reviewer", Some("01JD"), Some("09:00"), Some("-05:00")));
+        assert_eq!(add.prompt, ["review", "merges"]);
+        let Command::Schedule { command: ScheduleCommand::Add(add) } =
+            parses(&["schedule", "add", "@scout", "--new", "Audit", "--project", "/src/a", "--project", "/src/b", "--every", "7d", "go"])
+        else {
+            panic!()
+        };
+        assert_eq!((add.new.as_deref(), add.projects.len(), add.every.as_deref()), (Some("Audit"), 2, Some("7d")));
+        let fails = |args: &[&str]| Cli::try_parse_from([&["axel", "schedule", "add", "@a"], args].concat()).is_err();
+        assert!(fails(&["--every", "1h", "go"]), "no place");
+        assert!(fails(&["--thread", "t", "go"]), "no time");
+        assert!(fails(&["--thread", "t", "--new", "x", "--every", "1h", "go"]), "two places");
+        assert!(fails(&["--thread", "t", "--every", "1h", "--daily", "09:00", "go"]), "two times");
+        assert!(fails(&["--thread", "t", "--every", "1h"]), "no prompt");
+        assert!(matches!(parses(&["schedules", "list"]), Command::Schedule { command: ScheduleCommand::Ls { all: false } }));
+        assert!(matches!(parses(&["schedule", "tick"]), Command::Schedule { command: ScheduleCommand::Tick }));
+    }
+
+    #[test]
     fn plurals_and_verb_synonyms_reach_the_same_commands() {
         assert!(matches!(parses(&["sessions", "ls"]), Command::Session { command: SessionCommand::Ls { .. } }));
         assert!(matches!(parses(&["session", "list"]), Command::Session { command: SessionCommand::Ls { .. } }));
@@ -667,6 +898,25 @@ mod alias_tests {
         assert_eq!((runs.as_deref(), model), (Some("goose/gpt-5.5"), None));
         let Command::Agent { command: AgentCommand::Edit { runs, model, .. } } = parses(&["agent", "edit", "opus", "--model", "fable"]) else { panic!() };
         assert_eq!((runs, model.as_deref()), (None, Some("fable")));
+    }
+
+    #[test]
+    fn a_team_takes_members_with_roles_and_repeats_its_flags() {
+        let Command::Team { command: TeamCommand::New { name, lead, members, skills, reach } } =
+            parses(&["team", "new", "core", "--lead", "coordinator", "--member", "scout:code reconnaissance", "--member", "reviewer", "--skills", "./skills/core", "--reach", "lead"])
+        else {
+            panic!()
+        };
+        assert_eq!((name.as_str(), lead.as_deref(), reach), ("core", Some("coordinator"), TeamReachArg::Lead));
+        assert_eq!(members, ["scout:code reconnaissance", "reviewer"]);
+        assert_eq!(skills, ["./skills/core"]);
+        let Command::Team { command: TeamCommand::New { reach, .. } } = parses(&["team", "new", "solo"]) else { panic!() };
+        assert_eq!(reach, TeamReachArg::None, "no team rule unless asked");
+        assert!(matches!(parses(&["teams", "list"]), Command::Team { command: TeamCommand::Ls }));
+        assert!(matches!(parses(&["team", "edit", "core", "--add", "a:b", "--remove", "c"]), Command::Team { command: TeamCommand::Edit { .. } }));
+        assert!(matches!(parses(&["team", "rm", "core"]), Command::Team { command: TeamCommand::Rm { .. } }));
+        let Command::Agent { command: AgentCommand::Edit { policy, .. } } = parses(&["agent", "edit", "scout", "--reach", "team"]) else { panic!() };
+        assert_eq!(policy.reach, Some(ReachArg::Team));
     }
 
     #[test]

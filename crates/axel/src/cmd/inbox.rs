@@ -91,8 +91,27 @@ fn host_hints(text: &str, agents: &[axel_store::Agent]) -> HostHints {
 /// A [`MessageKind::Fyi`] message is tagged so, and becomes a note: read with
 /// the recipient's next turn, never a turn of its own or a summons.
 pub fn send_message(ctx: &Ctx, recipients: &[String], hosts: &[(String, String)], text: &str, kind: MessageKind) -> Result<SendReport> {
+    let origin = Origin { thread_id: std::env::var("AXEL_THREAD").ok().filter(|t| !t.trim().is_empty()), tags: vec![], created_at: None };
+    send_from(ctx, &origin, recipients, hosts, text, kind)
+}
+
+/// Where a message is sent from, beyond who is asking (the policy caller).
+#[derive(Clone, Debug, Default)]
+pub struct Origin {
+    /// The thread it goes on: `$AXEL_THREAD` for `axel send`, the schedule's
+    /// thread for a scheduled run.
+    pub thread_id: Option<String>,
+    /// Extra tags, such as a scheduled run's `["sched", id, n]`.
+    pub tags: Vec<Vec<String>>,
+    /// The envelope's `created_at` in Unix seconds; `None` is now.
+    pub created_at: Option<u64>,
+}
+
+/// [`send_message`] from an explicit [`Origin`]: the one path every message
+/// takes (reach, chatter, sign, post, then deliver: live note or summon).
+pub fn send_from(ctx: &Ctx, origin: &Origin, recipients: &[String], hosts: &[(String, String)], text: &str, kind: MessageKind) -> Result<SendReport> {
     super::policy::check_message(ctx, recipients)?;
-    let thread_id = std::env::var("AXEL_THREAD").ok().filter(|t| !t.trim().is_empty());
+    let thread_id = origin.thread_id.clone();
     let from_agent = super::policy::caller_agent();
     if let (Some(t), Some(_)) = (&thread_id, &from_agent) {
         check_chatter(ctx, t)?;
@@ -111,6 +130,12 @@ pub fn send_message(ctx: &Ctx, recipients: &[String], hosts: &[(String, String)]
     }
     if let Some(s) = super::policy::caller_session() {
         b = b.session(&s);
+    }
+    for tag in &origin.tags {
+        b = b.tag(tag.clone());
+    }
+    if let Some(at) = origin.created_at {
+        b = b.created_at(at);
     }
     match kind {
         MessageKind::Fyi => b = b.tag(vec![MessageKind::FYI_TAG.to_string()]),
@@ -147,7 +172,8 @@ pub const MAX_AGENT_MESSAGES: usize = 20;
 /// Refuse when agents have sent [`MAX_AGENT_MESSAGES`] on `thread_id` since
 /// the owner last wrote there.
 fn check_chatter(ctx: &Ctx, thread_id: &str) -> Result<()> {
-    let owner = ctx.owner()?.public().to_base58();
+    // The owner writes from any of its machines (RFD 0004).
+    let owner = ctx.store.principal(&ctx.owner()?.public().to_base58())?;
     let since_ms = ctx
         .store
         .thread_items(thread_id, 2000)?
@@ -156,12 +182,12 @@ fn check_chatter(ctx: &Ctx, thread_id: &str) -> Result<()> {
         .map(|it| it.at)
         .max()
         .unwrap_or(0);
-    let sent = ctx
-        .store
-        .thread_messages(thread_id)?
-        .iter()
-        .filter(|e| e.from != owner && secs_to_ms(e.created_at) >= since_ms)
-        .count();
+    let mut sent = 0_usize;
+    for e in ctx.store.thread_messages(thread_id)? {
+        if secs_to_ms(e.created_at) >= since_ms && ctx.store.principal(&e.from)? != owner {
+            sent += 1;
+        }
+    }
     if sent >= MAX_AGENT_MESSAGES {
         bail!(
             "agents have sent {sent} messages on this thread since the owner last wrote; stop and wait for the owner (the limit is {MAX_AGENT_MESSAGES})"
@@ -394,6 +420,9 @@ mod tests {
             created_at: 0,
             last_seen_at: None,
             archived_at: None,
+            profile_id: format!("p-pk-{name}"),
+            owner: None,
+            device: None,
         }
     }
 

@@ -43,7 +43,8 @@ pub enum Error { ... }  // thiserror
 ```rust
 pub mod kind { pub const NOTE: u32 = 1; pub const TASK: u32 = 2; pub const PERMISSION_REQUEST: u32 = 10;
   pub const PERMISSION_REPLY: u32 = 11; pub const QUESTION: u32 = 12; pub const ANSWER: u32 = 13;
-  pub const STATUS: u32 = 20; pub const HANDOFF: u32 = 30; pub fn name(k: u32) -> &'static str; }
+  pub const STATUS: u32 = 20; pub const HANDOFF: u32 = 30; pub const SCHEDULE: u32 = 124 /* "schedule"; no t tag */;
+  pub fn name(k: u32) -> &'static str; }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Envelope { pub id: String /*hex sha256*/, pub from: String /*b58*/, pub created_at: u64,
@@ -127,6 +128,10 @@ impl Store {
 
     // ---- the log ----
     pub fn append(&self, env: &Envelope) -> Result<Appended, Error>;   // verify sig; INSERT OR IGNORE into events; authorize; project. Idempotent.
+    pub fn append_all(&self, envs: &[Envelope], keep: impl FnMut(&Envelope) -> Result<bool, Error>) -> Result<Vec<Option<Appended>>, Error>;
+    // append for each, in order, in one transaction; each touched thread replayed once at the end (every thread once
+    // if a link or announcement changed who may sign). keep is asked right before each is stored (None = not stored).
+    // Outcomes are read after the replays. Any error stores nothing. More than 10 000 envelopes → Invalid.
     pub fn events_since(&self, cursor: i64, limit: usize) -> Result<Vec<(i64 /*seq*/, Envelope)>, Error>;   // for sync
     pub fn thread_events(&self, thread_id: &str) -> Result<Vec<Envelope>, Error>;                            // (created_at, id) order
     pub fn rebuild_projections(&self) -> Result<(), Error>;                                                   // replay the whole log
@@ -253,6 +258,174 @@ quota buckets, so each bucket is a plan of its own, keyed `Harness::Custom("<pre
 reported as `disabled` is cleared.
 
 Authorization in `append`: kind 100 → always (signer becomes owner). Other thread kinds → signer is a participant of `t`, or an agent whose `agents.auth_tag` owner is a participant, or (kinds 20/21/110–112) signer is one of this replica's own agents. Non-thread kinds (notes etc. without `t`) → always. Rejected envelopes are kept with `rejected_reason` and re-tried by `rebuild_projections`.
+
+## axel-store additions (profiles, instances, linked devices; RFD 0004, ADR 0012)
+
+```rust
+// kinds (axel_inbox::kind): OWNER_DEVICE = 120, AGENT_ANNOUNCE = 121, AGENT_PROFILE = 122;
+// is_owner_record(k) for 120..130 (on no thread, sent to every device of the owner).
+pub const PRINCIPAL_DEPTH_MAX: usize = 4;         // device → owner links authorization walks
+str_enum PairingRoute { RexTailscale => "rex_tailscale", Ssh => "ssh", Wireguard => "wireguard", Confirm => "confirm" }
+str_enum DeviceOp { Link => "link", Revoke => "revoke", Label => "label" }
+pub struct DeviceRecord { pub op: DeviceOp, pub device: String, pub label: String, pub route: Option<PairingRoute>, pub consent: Option<String> }   // kind 120; route and the device's consent required to link
+pub struct ProfileWire { pub profile_id, pub owner, pub name, pub harness, pub model, pub effort, pub skills, pub prompt, pub color, pub runtime_mode, pub archived: bool, pub merged_into: Option<String> }  // kind 122; merged_into left out when None
+pub const MERGE_CHAIN_MAX: usize = 8;             // merges followed from a profile to the one that survives
+impl ProfileWire { pub fn of(p: &AgentProfile, owner: &str) -> ProfileWire; }
+pub struct AnnounceWire { pub instance: String, pub profile_id: String, pub auth: Vec<String> }   // kind 121, signed by the device
+pub struct AgentProfile { pub profile_id, pub owner: Option<String>, pub name, pub harness, pub model, pub effort, pub skills, pub prompt, pub color, pub runtime_mode, pub created_at, pub updated_at, pub updated_id: Option<String>, pub archived_at, pub merged_into: Option<String> }
+impl AgentProfile { pub fn same_definition(&self, other: &AgentProfile) -> bool; }   // harness, model, effort, skills (as a set), prompt, mode; not colour
+pub struct Device { pub pubkey: String, pub owner: Option<String>, pub label: String, pub route: Option<PairingRoute>, pub linked_at: i64, pub revoked_at: Option<i64> }
+// Agent gains: profile_id: String, owner: Option<String>, device: Option<String> (None = this machine).
+// NewAgent gains: profile_id: Option<String> (None = a new profile from its fields), device: Option<String>.
+pub enum OwnerRecords { Links, All }              // which owner records a peer gets
+impl Store {
+    pub fn devices(&self) -> Result<Vec<Device>, Error>; pub fn device(&self, pk: &str) -> Result<Option<Device>, Error>;
+    pub fn device_by_label(&self, label: &str, owner: &str) -> Result<Option<Device>, Error>;   // a live link speaking for `owner`
+    pub fn principal(&self, key: &str) -> Result<String, Error>;      // the owner `key` speaks for now
+    pub fn profile(&self, id: &str) -> Result<Option<AgentProfile>, Error>; pub fn profile_by_name(&self, name: &str) -> Result<Option<AgentProfile>, Error>;
+    pub fn profiles(&self) -> Result<Vec<AgentProfile>, Error>; pub fn unsigned_profiles(&self, owner: &str) -> Result<Vec<AgentProfile>, Error>;
+    pub fn name_clashes(&self, owner: &str) -> Result<Vec<Vec<AgentProfile>>, Error>;   // names 2+ live profiles of `owner` share; each oldest first
+    pub fn merge_profile(&self, from: &str, into: &str, owner: &str) -> Result<(), Error>;   // archive `from`, set merged_into, move its instances; unsigned
+    pub fn rename_profile(&self, profile_id: &str, name: &str) -> Result<(), Error>;   // Conflict when the owner has a live profile of that name
+    pub fn list_instances(&self) -> Result<Vec<Agent>, Error>; pub fn profile_instances(&self, profile_id: &str) -> Result<Vec<Agent>, Error>;
+    pub fn agent_on_device(&self, name: &str, device: &str) -> Result<Option<Agent>, Error>;
+    pub fn unannounced_instances(&self) -> Result<Vec<(String, String, Vec<String>)>, Error>;   // (instance, profile_id, auth tag)
+    pub fn thread_events_since(&self, cursor: i64, threads: Option<&[String]>, records: OwnerRecords, limit: usize) -> Result<Vec<(i64, Envelope)>, Error>;
+}
+// list_agents: one row per profile (this machine's instance first). agent_by_name: this machine's
+// instance, else the most recently seen. Profile setters edit the instance's profile and leave it unsigned.
+// insert_agent: Conflict when a live profile of the same owner has the name, or when it would join
+// a profile whose owner its attester doesn't speak for. Owners compare as principals.
+// profile_by_name: Conflict when two live profiles of one owner share the name (two linked homes).
+// A kind-122 merge needs its target to be another profile of the same owner that doesn't lead back;
+// a target not received yet waits, as other records do. An announcement under a merged profile lands
+// on the one that survives.
+// inbox / unread_count: messages to any live key that resolves to the same owner.
+```
+
+Authorization resolves keys to principals before every check above: a signer, an attested owner, a
+roster entry, a participant change's signer and target.
+
+```rust
+// axel-identity
+pub mod pairing { pub const DOMAIN: &str = "axel:pair:v1:"; pub const CODE_DIGITS: u32 = 8;
+    pub fn confirm_code(owner: &PublicKey, device: &PublicKey) -> String;   // "1234-5678"
+    pub fn code_matches(expected: &str, typed: &str) -> bool;
+    pub const LINK_CONSENT_DOMAIN: &str = "axel:device-link:v1:";
+    pub fn consent_to_link(device: &Keypair, owner: &PublicKey) -> String;   // hex signature
+    pub fn verify_link_consent(owner: &PublicKey, device: &PublicKey, consent_hex: &str) -> Result<(), Error>; }
+```
+
+## axel-store additions (scheduled work, RFD 0006)
+
+```rust
+pub const SCHEDULE_RUN_TAG: &str = "sched";      // a run's tag: ["sched", schedule_id, run_number]
+pub const RUNS_MAX_DEFAULT: u32 = 1000; pub const RUNS_MAX_LIMIT: u32 = 100_000;
+pub const INTERVAL_SECS_MIN: u64 = 60; pub const INTERVAL_SECS_MAX: u64 /* 366 days */;
+pub const TZ_OFFSET_MINUTES_MAX: i32 = 840; pub const PROMPT_BYTES_MAX: usize = 65_536;
+pub const SCHEDULE_ID_CHARS_MAX: usize = 64; pub const NEW_THREAD_PROJECTS_MAX: usize = 16;
+pub const TIMESTAMP_MAX: i64 /* 9999-12-31T23:59:59Z */; pub const SCHEDULES_LIST_MAX: usize = 1000;
+pub enum ScheduleAction { Add, Cancel }                       // str_enum: as_str, FromStr, Display, ALL
+pub enum FinishReason { Cancelled, RunsMax, Until, Done }     // str_enum
+#[serde(rename_all="snake_case")] pub enum ScheduleWhen {     // {"once":{"at":..}} {"every":{"interval_s":..}} {"daily":{"hh","mm","tz_offset_minutes"}}
+    Once { at: i64 }, Every { #[serde(rename="interval_s")] interval_secs: u64 }, Daily { hh: u8, mm: u8, tz_offset_minutes: i32 } }
+impl ScheduleWhen { pub fn validate(self) -> Result<(), Error>;
+    pub fn occurrences_between(self, anchor: i64, after: i64, through: i64) -> u64;   // in (after, through]; every counts from anchor
+    pub fn next_after(self, anchor: i64, after: i64) -> Option<i64>; }
+pub struct NewThreadSpec { pub title: String, pub projects: Vec<String> }
+pub enum RunThread { Existing(String), New(NewThreadSpec) }
+pub struct ScheduleWire { pub schedule_id: String, pub op: ScheduleAction, pub to, thread: Option<String>, pub new_thread: Option<NewThreadSpec>,
+    pub prompt: Option<String>, pub when: Option<ScheduleWhen>, pub runs_max: Option<u32>, pub until: Option<i64>, pub device: Option<String> }   // kind 124 content
+impl ScheduleWire { pub fn cancel(schedule_id: &str) -> ScheduleWire; }
+pub struct ScheduleSpec { pub schedule_id: String, pub to: String, pub thread: RunThread, pub prompt: String, pub when: ScheduleWhen,
+    pub runs_max: u32, pub until: Option<i64>, pub device: String /* environment id */ }
+impl ScheduleSpec { pub fn validate(&self) -> Result<(), Error>; pub fn to_wire(&self) -> ScheduleWire; pub fn from_wire(w: ScheduleWire) -> Result<ScheduleSpec, Error>; }
+pub struct Schedule { pub spec: ScheduleSpec, pub event_id: String, pub author: String, pub created_at: i64, pub cancelled_at: Option<i64> }
+pub struct ScheduleRun { pub schedule_id: String, pub run_number: u32, pub event_id: String, pub fired_at: i64 }
+pub enum RunCheck { Due { run_number: u32, missed_runs: u64 }, Busy { session_id: String }, NotDue { next_at: i64 }, Finished(FinishReason) }
+pub fn plan_run(s: &Schedule, last_run: Option<&ScheduleRun>, now: i64) -> RunCheck;   // pure; never Busy; nothing fires once now > until
+pub fn run_text(prompt: &str, missed_runs: u64) -> String;   // the prompt, plus how many runs it stands for
+pub fn run_tag(schedule_id: &str, run_number: u32) -> Vec<String>;
+pub fn parse_run_tag(env: &Envelope) -> Option<(String, u32)>;   // kind 1 only
+impl Store {
+    pub fn add_schedule(&self, signer: &Keypair, spec: &ScheduleSpec, now: i64) -> Result<Schedule, Error>;   // envelope created_at = now
+    pub fn cancel_schedule(&self, signer: &Keypair, schedule_id: &str, now: i64) -> Result<(), Error>;      // author only (Unauthorized otherwise)
+    pub fn schedule(&self, id: &str) -> Result<Option<Schedule>, Error>;
+    pub fn schedules(&self, limit: usize) -> Result<Vec<Schedule>, Error>;                                  // created_at asc, capped at SCHEDULES_LIST_MAX
+    pub fn schedule_runs(&self, id: &str, limit: usize) -> Result<Vec<ScheduleRun>, Error>;                 // run_number desc
+    pub fn last_schedule_run(&self, id: &str) -> Result<Option<ScheduleRun>, Error>;
+    pub fn check_schedule(&self, s: &Schedule, now: i64) -> Result<RunCheck, Error>;   // plan_run + Busy when the last run's session is working/running
+}
+```
+
+Projections `schedules(schedule_id PK, event_id, author, to_pubkey, device, created_at, cancelled_at, content)` and
+`schedule_runs(schedule_id, run_number, event_id UNIQUE, fired_at, PRIMARY KEY(schedule_id, run_number))`, one migration.
+`append` drops (does not store) a kind-1 note whose `["sched", id, n]` is already recorded under another event id:
+`Appended { inserted: false, projected: false, rejected_reason: Some(..) }`, so `post` fails. Malformed or unfireable
+kind-124 content is stored and rejected.
+
+`axel` (bin): `cmd::inbox::send_from(ctx, &Origin { thread_id, tags, created_at }, recipients, hosts, text, kind)` is
+`send_message` with an explicit thread, extra tags and timestamp; `cmd::policy::act_as_owner()` makes policy checks
+treat the owner as the caller. `cmd::schedule::tick(ctx, now) -> Vec<(Schedule, Fired)>`, with
+`Fired { Sent { run_number, missed_runs, report }, Busy { session_id }, Refused { error } }`.
+
+## axel-store additions (teams, RFD 0005)
+
+```rust
+// axel-inbox kind: TEAM = 123 ("team"), an owner record (120..130) on no thread, tag ["d", team_id].
+#[serde(rename_all="snake_case")] #[derive(Default)] pub enum TeamReach { #[default] None, Team, Lead }  // str_enum: "none" | "team" | "lead"
+pub struct TeamMember { pub profile_id: String, #[serde(default)] pub role: String }
+pub struct Team { pub team_id: String, pub owner: String, pub name: String, pub members: Vec<TeamMember>, pub skills: Vec<String>,
+    pub reach: TeamReach, pub lead: Option<String> /* profile id, always a member */, pub created_at: i64, pub updated_at: i64,
+    pub updated_id: Option<String> /* None until signed */, pub archived_at: Option<i64> }
+impl Team { pub fn has_member(&self, profile_id: &str) -> bool; }
+#[derive(Default)] pub struct NewTeam { pub owner: String /* principal */, pub name: String, pub members: Vec<TeamMember>, pub skills: Vec<String>, pub reach: TeamReach, pub lead: Option<String> }
+#[derive(Default)] pub struct TeamEdit { pub add: Vec<TeamMember>, pub remove: Vec<String>, pub lead: Option<String>, pub skills: Option<Vec<String>>, pub reach: Option<TeamReach> }
+
+// Kind-123 content. Latest (created_at, id) per team_id wins; an unknown policy.reach reads as None.
+pub struct TeamWire { pub team_id: String, pub owner: String, pub name: String, pub members: Vec<TeamMember>, pub skills: Vec<String>,
+    pub policy: TeamPolicyWire, pub lead: Option<String>, pub archived: bool }
+pub struct TeamPolicyWire { pub reach: TeamReach }
+impl TeamWire { pub fn of(team: &Team) -> TeamWire; }
+
+pub const TEAM_MEMBERS_MAX: usize;            // 32
+pub const TEAM_SKILLS_MAX: usize;             // 16 sources
+pub const TEAM_NAME_BYTES_MAX: usize;         // 64; names are letters, digits, - and _
+pub const TEAM_ROLE_BYTES_MAX: usize;         // 200, one line
+pub const TEAM_SKILL_SOURCE_BYTES_MAX: usize; // 512
+pub const TEAMS_MAX: usize;                   // 256, the most one read returns
+pub fn is_valid_team_name(name: &str) -> bool;
+
+impl Store {
+    pub fn create_team(&self, new: &NewTeam) -> Result<Team, Error>;       // unsigned; Conflict on a live name of the same owner, Invalid past a limit or for a member that isn't the owner's profile
+    pub fn edit_team(&self, team_id: &str, edit: &TeamEdit) -> Result<Team, Error>;  // unsigned, newer than what it changes; removing the lead needs another
+    pub fn archive_team(&self, team_id: &str) -> Result<Team, Error>;      // unsigned; rule and skills stop applying
+    pub fn team(&self, team_id: &str) -> Result<Option<Team>, Error>;      // archived ones too
+    pub fn team_by_name(&self, name: &str) -> Result<Option<Team>, Error>; // live, oldest first
+    pub fn teams(&self) -> Result<Vec<Team>, Error>;                       // live, by name
+    pub fn teams_of_profile(&self, profile_id: &str) -> Result<Vec<Team>, Error>;  // live
+    pub fn unsigned_teams(&self, owner: &str) -> Result<Vec<Team>, Error>; // what the next publish signs
+    pub fn effective_reach(&self, pubkey: &str) -> Result<EffectiveReach, Error>;
+    pub fn may_reach(&self, from: &str, to: &str) -> Result<bool, Error>;  // check_summon uses it
+}
+
+// Reach gains two values; the list is agents allowed on top. Serialized {"kind":"team","agents":[…]}.
+pub enum Reach { Nobody, Anyone, Only(Vec<String>), Team(Vec<String>), Lead(Vec<String>) }
+impl Reach { pub fn listed(&self) -> &[String]; /* allows/allow/disallow as before */ }
+pub struct TeamReachPart { pub team_id: String, pub team_name: String, pub reach: TeamReach, pub lead: Option<String>, pub profiles: Vec<String> }
+#[derive(Default)] pub struct EffectiveReach { pub own: Reach, pub own_profiles: Vec<String>, pub teams: Vec<TeamReachPart> }
+impl EffectiveReach { pub fn allows(&self, target: &str, target_profile: Option<&str>) -> bool; pub fn from_teams(&self) -> bool; }
+```
+
+Schema v14 adds `teams (team_id PK, owner, name, skills_json, reach, lead, created_at, updated_at,
+updated_id, archived_at)` and `team_members (team_id, profile_id, role, position; PK (team_id,
+profile_id))`. Neither is a projection table that `rebuild_projections` empties: unsigned local edits
+live there, as in `agent_profiles`.
+
+`axel` (bin): `axel team new|edit|show|ls|rm` (`cmd/team.rs`) publish a kind-123 envelope signed
+with the owner key after every change. `launch::install_skills(driver, work_dir, &SkillLevels {
+requested, config, global, team })` installs the agent's skills and its teams'; `launch::system_prompt(agent,
+dir, roster)` takes the roster `team::roster(store, profile_id)` writes.
 
 ## axel-rex (shells out to the `rex` CLI with `--json`; no WS yet)
 

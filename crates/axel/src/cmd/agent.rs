@@ -204,6 +204,9 @@ fn show(ctx: &Ctx, name: &str) -> Result<()> {
     println!("{}", if has_key { t!("key in keystore: yes") } else { t!("key in keystore: MISSING") });
     let p = ctx.store.agent_policy(&a.pubkey)?;
     print_policy(ctx, &p);
+    for line in super::policy::team_reach_lines(ctx, &ctx.store.effective_reach(&a.pubkey)?) {
+        println!("  {line}");
+    }
     print_effort(&a.harness, a.effort);
     print_host(ctx, &a.pubkey)?;
     let spent = ctx.store.agent_spend_since(&a.pubkey, axel_store::local_day_start())?;
@@ -214,12 +217,29 @@ fn show(ctx: &Ctx, name: &str) -> Result<()> {
         let line = if ok { t!("owner attestation: valid (owner {owner})", owner = tag.owner) } else { t!("owner attestation: INVALID (owner {owner})", owner = tag.owner) };
         println!("{line}");
     }
+    print_instances(ctx, &a)?;
+    let me = ctx.store.principal(&ctx.owner()?.public().to_base58())?;
+    if ctx.store.name_clashes(&me)?.iter().any(|clash| clash[0].name == a.name) {
+        println!("{}", t!("another agent of yours is also named {name}: settle it with `axel device merge {name}`", name = a.name));
+    }
+    Ok(())
+}
+
+/// Where the agent's profile runs: one line per instance (RFD 0004).
+fn print_instances(ctx: &Ctx, a: &axel_store::Agent) -> Result<()> {
+    for instance in ctx.store.profile_instances(&a.profile_id)? {
+        let place = match &instance.device {
+            None => t!("this machine").to_string(),
+            Some(device) => ctx.store.device(device)?.map_or_else(|| device.clone(), |d| d.label),
+        };
+        println!("{}", t!("instance {key} on {place}", key = instance.pubkey, place = place));
+    }
     Ok(())
 }
 
 /// An agent name as people type it: letters, digits, `-` and `_`, so it
 /// works as an `@mention`.
-fn valid_name(name: &str) -> Result<&str> {
+pub(super) fn valid_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
         bail!("{}", t!("agent names are letters, digits, - and _ so they work as @mentions"));
@@ -258,6 +278,8 @@ pub fn create(
         color,
         runtime_mode,
         auth_tag: Some(tag.to_tag()),
+        profile_id: None,
+        device: None,
     })?;
     Ok(agent)
 }
@@ -295,6 +317,8 @@ fn apply_policy(ctx: &Ctx, me: &str, p: &mut AgentPolicy, args: &PolicyArgs) -> 
         p.reach = match r {
             ReachArg::Nobody => Reach::Nobody,
             ReachArg::Anyone => Reach::Anyone,
+            ReachArg::Team => Reach::Team(Vec::new()),
+            ReachArg::Lead => Reach::Lead(Vec::new()),
         };
     }
     let resolve = |n: &str| -> Result<String> {
