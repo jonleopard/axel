@@ -142,6 +142,18 @@ pub enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// How thread views are drawn: `terminal` (text, the default) or `web`
+    /// (experimental: a web page drawn by Ladybird, where it is installed).
+    Panes {
+        #[arg(value_name = "terminal|web", value_parser = crate::cmd::display::parse_display)]
+        choice: Option<crate::cmd::display::Display>,
+    },
+    /// A thread's view as a web page (RFD 0007).
+    #[command(hide = true)]
+    Web {
+        #[command(subcommand)]
+        command: WebCommand,
+    },
     /// Exchange threads, transcripts and job branches with remote hosts.
     Sync {
         /// Host label; all hosts when omitted.
@@ -149,6 +161,22 @@ pub enum Command {
         /// Keep syncing while the host runs sessions for us.
         #[arg(long)]
         follow: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum WebCommand {
+    /// This pane shows one of a thread view's panes as a web page (what a web pane runs).
+    Pane {
+        thread: String,
+        #[arg(long, default_value = "messages", value_name = "messages|composer|activity|controls", value_parser = crate::cmd::display::parse_pane)]
+        view: crate::cmd::display::Pane,
+    },
+    /// Serve a thread view's page and print its address, for a desktop browser.
+    Serve {
+        thread: String,
+        #[arg(long, default_value = "messages", value_name = "messages|composer|activity|controls", value_parser = crate::cmd::display::parse_pane)]
+        view: crate::cmd::display::Pane,
     },
 }
 
